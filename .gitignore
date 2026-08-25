@@ -1,0 +1,37 @@
+# Python / Virtual Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Environment Variables & Credentials
+.env
+*.pem
+*.key
+
+# Data & DB Directories
+data/raw/*
+!data/raw/.gitkeep
+data/vault/*
+!data/vault/.gitkeep
+db_kuzu/
+db_kuzu
+db_chroma/
+db_chroma
+.kuzu/
+.chroma/
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
