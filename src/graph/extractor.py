@@ -45,14 +45,20 @@ Text to analyze:
 
 
 class EntityRelationExtractor:
-    """Extractor for entities and relationships using LLM structured output with fallback."""
+    """Extractor for entities and relationships supporting local free LLMs (Ollama, LM Studio, LocalAI) and API providers."""
 
-    def __init__(self, api_key: str = None, model: str = None):
+    def __init__(self, provider: str = None, api_key: str = None, base_url: str = None, model: str = None):
+        self.provider = (provider or settings.llm_provider).lower()
         self.api_key = api_key or settings.openai_api_key
+        self.base_url = base_url or settings.openai_base_url
         self.model = model or settings.llm_model
         
-        if self.api_key and self.api_key != "mock-key":
-            self.client = OpenAI(api_key=self.api_key, base_url=settings.openai_base_url)
+        if OpenAI and self.provider != "mock":
+            try:
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            except Exception as e:
+                logger.warning(f"Could not initialize LLM client for {self.base_url}: {e}")
+                self.client = None
         else:
             self.client = None
 
@@ -61,22 +67,26 @@ class EntityRelationExtractor:
         if not text.strip():
             return ExtractionResult()
 
-        if self.client:
+        if self.client and self.provider != "mock":
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    response_format={"type": "json_object"},
-                    messages=[
+                kwargs = {
+                    "model": self.model,
+                    "messages": [
                         {"role": "system", "content": "You extract structured knowledge graphs in strict JSON format."},
                         {"role": "user", "content": EXTRACTION_PROMPT.format(text=text)}
                     ],
-                    temperature=0.0,
-                )
+                    "temperature": 0.0,
+                }
+                # Request JSON mode if supported
+                if self.provider in ["openai", "ollama"]:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+                response = self.client.chat.completions.create(**kwargs)
                 raw_json = response.choices[0].message.content
                 data = json.loads(raw_json)
                 return ExtractionResult.model_validate(data)
             except Exception as e:
-                logger.warning(f"LLM Extraction failed: {e}. Falling back to rule-based extraction.")
+                logger.info(f"Local/Remote LLM extraction notice ({e}). Falling back to zero-cost heuristic extraction.")
 
         return self._heuristic_fallback_extraction(text, source_doc)
 

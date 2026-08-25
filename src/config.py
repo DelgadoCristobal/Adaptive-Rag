@@ -16,11 +16,12 @@ class Settings(BaseSettings):
             extra="ignore"
         )
 
-    # API Configuration
-    openai_api_key: str = "mock-key"
-    openai_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
+    # LLM & Provider Configuration (100% Free / Local by default)
+    llm_provider: str = "ollama"  # Options: "ollama", "openai", "local", "mock"
+    openai_api_key: str = "ollama-local-key"
+    openai_base_url: str = "http://localhost:11434/v1"  # Default Ollama / Local AI endpoint
+    llm_model: str = "llama3.2"
+    embedding_model: str = "all-MiniLM-L6-v2"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # Paths

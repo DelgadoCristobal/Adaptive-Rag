@@ -20,14 +20,20 @@ Retrieved Context:
 
 
 class AnswerSynthesizer:
-    """Grounded answer generation engine with citation traceability."""
+    """Grounded answer generation engine supporting local free LLMs (Ollama, LM Studio, LocalAI) and API providers."""
 
-    def __init__(self, api_key: str = None, model: str = None):
+    def __init__(self, provider: str = None, api_key: str = None, base_url: str = None, model: str = None):
+        self.provider = (provider or settings.llm_provider).lower()
         self.api_key = api_key or settings.openai_api_key
+        self.base_url = base_url or settings.openai_base_url
         self.model = model or settings.llm_model
 
-        if self.api_key and self.api_key != "mock-key":
-            self.client = OpenAI(api_key=self.api_key, base_url=settings.openai_base_url)
+        if OpenAI and self.provider != "mock":
+            try:
+                self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+            except Exception as e:
+                logger.warning(f"Could not initialize Synthesizer client for {self.base_url}: {e}")
+                self.client = None
         else:
             self.client = None
 
