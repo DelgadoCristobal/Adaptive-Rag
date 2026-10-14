@@ -1,4 +1,3 @@
-import pytest
 from src.graph.schema import Entity, Relation, ExtractionResult
 from src.graph.extractor import EntityRelationExtractor
 from src.graph.deduplication import EntityDeduplicator

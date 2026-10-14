@@ -1,31 +1,29 @@
 from pathlib import Path
-import pytest
-from src.ingest.pdf_parser import PDFParser
-from src.ingest.docx_parser import DOCXParser
-from src.ingest.pptx_parser import PPTXParser
-from src.ingest.pipeline import DocumentIngestPipeline
+from src.ingestion.universal_parser import UniversalDocumentParser, SourceType
 
 
-def test_parsers_fallback_with_dummy_files(tmp_path):
-    # Test markdown input pipeline processing
+def test_universal_parser_markdown(tmp_path):
     md_file = tmp_path / "test_doc.md"
     md_file.write_text("# Test Title\nThis is test content.", encoding="utf-8")
 
+    md_dir = tmp_path / "markdown"
     vault_dir = tmp_path / "vault"
-    vault_dir.mkdir()
+    parser = UniversalDocumentParser(markdown_dir=md_dir, vault_dir=vault_dir)
+    
+    proc_doc = parser.parse_and_export(md_file)
+    assert proc_doc.doc_id == "test_doc"
+    assert proc_doc.source_type == SourceType.MARKDOWN
+    assert len(proc_doc.chunks) >= 1
+    assert "This is test content." in proc_doc.markdown_content
+    assert (md_dir / "test_doc.md").exists()
+    assert (vault_dir / "test_doc.md").exists()
 
-    pipeline = DocumentIngestPipeline(raw_dir=tmp_path, vault_dir=vault_dir)
-    output_path = pipeline.process_file(md_file)
 
-    assert output_path.exists()
-    assert output_path.name == "test_doc.md"
-    assert "This is test content" in output_path.read_text(encoding="utf-8")
+def test_universal_parser_text(tmp_path):
+    txt_file = tmp_path / "notes.txt"
+    txt_file.write_text("Simple plain text notes for indexing.", encoding="utf-8")
 
-
-def test_pptx_parser(tmp_path):
-    parser = PPTXParser()
-    dummy_file = tmp_path / "sample.pptx"
-    dummy_file.write_bytes(b"dummy pptx content")
-    result = parser.parse(dummy_file)
-    assert "title: sample" in result
-    assert "file_type: pptx" in result
+    parser = UniversalDocumentParser(markdown_dir=tmp_path / "md", vault_dir=tmp_path / "vault")
+    proc_doc = parser.parse_file(txt_file)
+    assert proc_doc.doc_id == "notes"
+    assert "Simple plain text notes" in proc_doc.markdown_content

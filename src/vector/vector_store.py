@@ -1,13 +1,15 @@
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import logging
 from src.config import settings
+
+import re
 
 logger = logging.getLogger(__name__)
 
 
 class VectorStoreManager:
-    """Dense Vector Manager using ChromaDB for document chunks and concept summaries."""
+    """Dense Vector Manager using ChromaDB with Semantic Chunking and Parent-Child Context Retrieval."""
 
     def __init__(self, db_path: Path = None, collection_name: str = "corporate_brain"):
         self.db_path = Path(db_path) if db_path else settings.chroma_db_path
@@ -55,41 +57,93 @@ class VectorStoreManager:
             i += (chunk_size - overlap)
         return chunks
 
+    def chunk_text_semantic(self, text: str, max_chunk_chars: int = 500) -> List[Dict[str, str]]:
+        """Split text semantically respecting markdown headers and paragraphs, returning child/parent pairs."""
+        sections = re.split(r'(?m)(?=^#{1,4}\s+)', text)
+        results = []
+        for sec in sections:
+            sec = sec.strip()
+            if not sec:
+                continue
+
+            header_match = re.match(r'^(#{1,4}\s+[^\n]+)', sec)
+            header = header_match.group(1).strip() if header_match else ""
+            body = sec[len(header):].strip() if header else sec
+
+            paragraphs = [p.strip() for p in re.split(r'\n\s*\n', body) if p.strip()]
+            if not paragraphs:
+                results.append({"child_text": sec[:max_chunk_chars], "parent_text": sec, "section": header})
+                continue
+
+            for p in paragraphs:
+                if len(p) <= max_chunk_chars:
+                    child = f"{header}\n{p}".strip() if header else p
+                    results.append({"child_text": child, "parent_text": sec, "section": header})
+                else:
+                    sentences = re.split(r'(?<=[.!?])\s+', p)
+                    curr_child = []
+                    curr_len = 0
+                    for s in sentences:
+                        curr_child.append(s)
+                        curr_len += len(s)
+                        if curr_len >= max_chunk_chars:
+                            c_text = " ".join(curr_child)
+                            child = f"{header}\n{c_text}".strip() if header else c_text
+                            results.append({"child_text": child, "parent_text": sec, "section": header})
+                            curr_child = []
+                            curr_len = 0
+                    if curr_child:
+                        c_text = " ".join(curr_child)
+                        child = f"{header}\n{c_text}".strip() if header else c_text
+                        results.append({"child_text": child, "parent_text": sec, "section": header})
+        return results if results else [{"child_text": text[:max_chunk_chars], "parent_text": text, "section": ""}]
+
     def add_documents(self, doc_id: str, content: str, metadata: Dict[str, Any] = None):
-        """Chunk text content and add embeddings to ChromaDB or in-memory fallback."""
-        chunks = self.chunk_text(content)
-        if not chunks:
+        """Chunk text semantically with Parent-Child metadata and add embeddings to ChromaDB."""
+        pairs = self.chunk_text_semantic(content)
+        if not pairs:
             return
 
-        if not self.collection:
-            for idx, chunk in enumerate(chunks):
-                self.in_memory_docs.append({
-                    "id": f"{doc_id}_chunk_{idx}",
-                    "content": chunk,
-                    "metadata": {"doc_id": doc_id, "chunk_index": idx, **(metadata or {})}
-                })
-            logger.info(f"Added {len(chunks)} chunks for {doc_id} to in-memory vector store.")
-            return
-
-        ids = [f"{doc_id}_chunk_{idx}" for idx in range(len(chunks))]
+        documents = [p["child_text"] for p in pairs]
+        ids = [f"{doc_id}_chunk_{idx}" for idx in range(len(pairs))]
         metadatas = [
             {
                 "doc_id": doc_id,
+                "source_doc_id": doc_id,
                 "chunk_index": idx,
+                "section": p.get("section", ""),
+                "parent_text": p["parent_text"][:2000],
                 **(metadata or {})
             }
-            for idx in range(len(chunks))
+            for idx, p in enumerate(pairs)
         ]
 
+        if not self.collection:
+            for c_id, doc_text, meta in zip(ids, documents, metadatas):
+                self.in_memory_docs.append({
+                    "id": c_id,
+                    "content": doc_text,
+                    "metadata": meta
+                })
+            logger.info(f"Added {len(documents)} semantic chunks for {doc_id} to in-memory vector store.")
+            return
+
         try:
-            self.collection.add(
-                documents=chunks,
-                metadatas=metadatas,
-                ids=ids
-            )
-            logger.info(f"Added {len(chunks)} chunks for document {doc_id} to ChromaDB")
+            if hasattr(self.collection, "upsert"):
+                self.collection.upsert(
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+            else:
+                self.collection.add(
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=ids
+                )
+            logger.info(f"Upserted {len(documents)} semantic chunks for document {doc_id} to ChromaDB")
         except Exception as e:
-            logger.error(f"Failed to add document {doc_id} to ChromaDB: {e}")
+            logger.error(f"Failed to upsert document {doc_id} to ChromaDB: {e}")
 
     def similarity_search(self, query: str, top_k: int = None) -> List[Dict[str, Any]]:
         """Perform dense vector k-NN search against text chunks."""

@@ -1,1 +1,1 @@
-"""Test package for GraphRAG corporate brain."""
+"""Tests suite for Adaptive GraphRAG."""

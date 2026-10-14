@@ -1,79 +1,71 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 import logging
 from src.config import settings
-from src.graph.kuzu_store import KuzuGraphStore
-from src.vector.vector_store import VectorStoreManager
+from .router import AdaptiveRouter, RetrievalStrategy
+from .vector_retriever import VectorRetriever
+from .graph_retriever import GraphRetriever
+from .community_retriever import CommunityRetriever
 from .reranker import CrossEncoderReranker
 
 logger = logging.getLogger(__name__)
 
 
 class HybridRetrievalEngine:
-    """Hybrid Retriever combining Dense Vector Search + Cypher Multi-Hop Graph Traversal."""
+    """Intelligent Multi-Strategy Retrieval Engine with Semantic Routing & Cross-Encoder Reranking."""
 
     def __init__(
         self,
-        graph_store: KuzuGraphStore = None,
-        vector_store: VectorStoreManager = None,
-        reranker: CrossEncoderReranker = None,
+        router: Optional[AdaptiveRouter] = None,
+        vector_retriever: Optional[VectorRetriever] = None,
+        graph_retriever: Optional[GraphRetriever] = None,
+        community_retriever: Optional[CommunityRetriever] = None,
+        reranker: Optional[CrossEncoderReranker] = None,
     ):
-        self.graph_store = graph_store or KuzuGraphStore()
-        self.vector_store = vector_store or VectorStoreManager()
+        self.router = router or AdaptiveRouter()
+        self.vector_retriever = vector_retriever or VectorRetriever()
+        self.graph_retriever = graph_retriever or GraphRetriever()
+        self.community_retriever = community_retriever or CommunityRetriever()
         self.reranker = reranker or CrossEncoderReranker()
 
-    def retrieve(self, query: str, top_k_vector: int = None, hops: int = None) -> List[Dict[str, Any]]:
-        """Retrieve candidate contexts via vector search + graph traversal, then rerank."""
-        top_k_vector = top_k_vector or settings.vector_top_k
-        hops = hops or settings.graph_hops
+    def retrieve(
+        self,
+        query: str,
+        strategy: Optional[RetrievalStrategy] = None,
+        top_k: int = None
+    ) -> Tuple[List[Dict[str, Any]], RetrievalStrategy]:
+        """Retrieve candidates using selected or automatically routed strategy, then rerank.
 
-        candidates = []
+        Args:
+            query: Input user question.
+            strategy: Optional explicit retrieval strategy to override router.
+            top_k: Number of final reranked results to return.
 
-        # 1. Vector Search
-        vector_results = self.vector_store.similarity_search(query, top_k=top_k_vector)
-        for res in vector_results:
-            candidates.append({
-                "type": "text_chunk",
-                "id": res.get("id"),
-                "text": res.get("content", ""),
-                "source": res.get("metadata", {}).get("doc_id", "unknown"),
-                "score": 1.0 - res.get("distance", 0.5)
-            })
+        Returns:
+            Tuple of (reranked candidate list, strategy used).
+        """
+        chosen_strategy = strategy or self.router.route_query(query)
+        top_k = top_k or settings.rerank_top_k
+        candidates: List[Dict[str, Any]] = []
 
-        # 2. Graph Traversal: Find seed entities in query
-        matched_entities = self.graph_store.search_entities_by_keyword(query)
-        # If no direct match, split words and query entities
-        if not matched_entities:
-            for word in query.split():
-                if len(word) > 3:
-                    matched_entities.extend(self.graph_store.search_entities_by_keyword(word))
+        if chosen_strategy == RetrievalStrategy.NAIVE_VECTOR:
+            candidates = self.vector_retriever.retrieve(query, top_k=settings.vector_top_k)
 
-        # Deduplicate seed entity IDs
-        seen_entity_ids = set()
-        for ent in matched_entities:
-            ent_id = ent.get("id")
-            if ent_id and ent_id not in seen_entity_ids:
-                seen_entity_ids.add(ent_id)
+        elif chosen_strategy == RetrievalStrategy.LOCAL_GRAPH:
+            candidates = self.graph_retriever.retrieve(query, hops=settings.graph_hops)
+            # If graph has no matching seed entities, fallback to vector chunks to prevent empty answers
+            if not candidates:
+                candidates = self.vector_retriever.retrieve(query, top_k=settings.vector_top_k)
 
-                # Add seed entity node description
-                candidates.append({
-                    "type": "graph_node",
-                    "id": ent_id,
-                    "text": f"Entity: {ent.get('name')} (Type: {ent.get('type')}) - {ent.get('description')}",
-                    "source": f"graph_node:{ent_id}",
-                    "score": 0.9
-                })
+        elif chosen_strategy == RetrievalStrategy.GLOBAL_COMMUNITY:
+            candidates = self.community_retriever.retrieve(query, limit=15)
+            # Include top vector hits for high-relevance grounding
+            candidates.extend(self.vector_retriever.retrieve(query, top_k=2))
 
-                # Perform K-hop neighborhood expansion
-                neighborhood = self.graph_store.query_k_hop_neighborhood(ent_id, hops=hops)
-                for path in neighborhood:
-                    candidates.append({
-                        "type": "graph_path",
-                        "id": f"{path['source']}->{path['target']}",
-                        "text": f"Graph Relation Path: [{path['source']}] is connected to [{path['target_name']} ({path['target_type']})]: {path['target_desc']}",
-                        "source": f"graph_path:{path['source']}->{path['target']}",
-                        "score": 0.85
-                    })
+        elif chosen_strategy == RetrievalStrategy.HYBRID_ADAPTIVE:
+            vec_candidates = self.vector_retriever.retrieve(query, top_k=settings.vector_top_k)
+            graph_candidates = self.graph_retriever.retrieve(query, hops=settings.graph_hops)
+            candidates = vec_candidates + graph_candidates
 
-        # 3. Cross-Encoder Re-ranking
-        reranked_results = self.reranker.rerank(query, candidates, top_k=settings.rerank_top_k)
-        return reranked_results
+        # Re-rank unified candidate pool with CrossEncoder
+        reranked = self.reranker.rerank(query, candidates, top_k=top_k)
+        return reranked, chosen_strategy
