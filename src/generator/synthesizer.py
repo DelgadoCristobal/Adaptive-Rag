@@ -1,35 +1,34 @@
 from typing import List, Dict, Any
 import logging
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None
-from src.config import settings
+from src.utils.llm_client import LLMClient, qualify_model
 
 logger = logging.getLogger(__name__)
 
 SYNTHESIS_SYSTEM_PROMPT = """You are an AI Enterprise Assistant with GraphRAG synthesis capabilities.
-Answer the user's question grounded STRICTLY on the retrieved context below (text chunks and knowledge graph paths).
-Every key assertion MUST include a explicit citation trace back to the retrieved context using [Citation: SourceID].
+Answer the user's question using the retrieved context below (text chunks and knowledge graph paths).
+Combine and reason over the evidence: extract the relevant facts, do simple calculations or comparisons when the numbers are present, and follow graph paths to connect entities.
+Cite the source number after each key assertion using [1], [2], etc. (e.g. "...SLO target is 99.8% [1].").
 
-If the retrieved context does not contain enough information, clearly state what is known and what is missing.
+If the context only partially answers the question, give the best answer the evidence supports and briefly note what is missing.
+Say the information is unavailable ONLY when the context contains nothing related to the question. Do not invent facts that are not in the context.
+
+LANGUAGE RULE: Reply in the same language as the question.
 
 Retrieved Context:
 {context_block}
 """
 
+# Conservative chars-per-token for numeric/financial text, and tokens reserved for the prompt scaffolding.
+CHARS_PER_TOKEN = 3
+PROMPT_OVERHEAD_TOKENS = 350
+
 
 class AnswerSynthesizer:
-    """Grounded answer generation engine with citation traceability."""
+    """Grounded answer generation engine supporting Gemini, Groq, Ollama, and OpenAI."""
 
-    def __init__(self, api_key: str = None, model: str = None):
-        self.api_key = api_key or settings.openai_api_key
-        self.model = model or settings.llm_model
-
-        if self.api_key and self.api_key != "mock-key":
-            self.client = OpenAI(api_key=self.api_key, base_url=settings.openai_base_url)
-        else:
-            self.client = None
+    def __init__(self, model: str = None):
+        self.model = qualify_model(model)
+        self.llm_client = LLMClient(default_model=self.model)
 
     def synthesize(self, query: str, retrieved_contexts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate answer with graph and document citations."""
@@ -39,35 +38,31 @@ class AnswerSynthesizer:
                 "citations": []
             }
 
-        # Build context block with explicit source IDs
+        # Ollama truncates overlong prompts from the START (dropping the instructions), so the context must
+        # fit in num_ctx minus the tokens reserved for generation and prompt scaffolding.
+        window = self.llm_client.num_ctx - self.llm_client.num_predict - PROMPT_OVERHEAD_TOKENS
+        per_item_chars = max(300, window * CHARS_PER_TOKEN // len(retrieved_contexts))
+
         context_lines = []
         citations = []
         for idx, item in enumerate(retrieved_contexts, start=1):
             source_id = item.get("source", f"ref_{idx}")
-            text = item.get("text", "")
+            text = item.get("text", "")[:per_item_chars]
             context_lines.append(f"[{idx}] Source ({source_id}): {text}")
             citations.append({"ref_num": idx, "source": source_id, "type": item.get("type", "unknown")})
 
         context_block = "\n\n".join(context_lines)
 
-        if self.client:
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": SYNTHESIS_SYSTEM_PROMPT.format(context_block=context_block)},
-                        {"role": "user", "content": query}
-                    ],
-                    temperature=0.2,
-                )
-                answer = response.choices[0].message.content
-                return {
-                    "answer": answer,
-                    "citations": citations,
-                    "raw_context": retrieved_contexts
-                }
-            except Exception as e:
-                logger.warning(f"LLM Synthesis failed: {e}. Using deterministic fallback synthesis.")
+        try:
+            answer = self.llm_client.complete(
+                prompt=query,
+                system_prompt=SYNTHESIS_SYSTEM_PROMPT.format(context_block=context_block),
+                model=self.model,
+                temperature=0.2,
+            )
+            return {"answer": answer, "citations": citations, "raw_context": retrieved_contexts}
+        except Exception as e:
+            logger.warning(f"LLM Synthesis notice ({e}). Using deterministic fallback synthesis.")
 
         # Fallback grounded synthesis formatting
         answer_parts = [

@@ -1,7 +1,6 @@
-import json
 import logging
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict
 from pathlib import Path
 import yaml
 try:
@@ -14,71 +13,123 @@ from .schema import Entity, Relation, ExtractionResult, ConceptNote
 
 logger = logging.getLogger(__name__)
 
-EXTRACTION_PROMPT = """You are an expert Knowledge Graph Architect. Extract all domain entities, types, properties, and directed relations from the text.
+EXTRACTION_PROMPT = """You are an expert Knowledge Graph Architect. Extract all key domain entities and directed relationships connecting them from the provided text.
+Ensure relation types are normalized to UPPER_SNAKE_CASE (for example: FOUNDED_BY, LOCATED_IN, PRODUCES, LEADS, PART_OF, ACQUIRED_BY, ASSOCIATED_WITH).
+Do NOT output placeholders like 'Canonical_Entity_Id' or 'UPPER_SNAKE_CASE_RELATION'; use the actual names and identifiers extracted from the text.
 
-Respond ONLY with valid JSON following this exact JSON Schema:
-{
+Example format:
+{{
   "entities": [
-    {
-      "id": "Canonical_Entity_Id",
-      "name": "Entity Name",
-      "type": "ORGANIZATION | PERSON | TECHNOLOGY | PROJECT | CONCEPT | LOCATION | EVENT",
-      "description": "Short explanation of entity in this document context",
-      "properties": {},
-      "aliases": ["Alias1"]
-    }
+    {{
+      "id": "Google",
+      "name": "Google LLC",
+      "type": "ORGANIZATION",
+      "description": "Technology company specializing in search and cloud computing"
+    }},
+    {{
+      "id": "Sundar_Pichai",
+      "name": "Sundar Pichai",
+      "type": "PERSON",
+      "description": "Chief Executive Officer of Alphabet and Google"
+    }}
   ],
-  "relations": [
-    {
-      "source": "Canonical_Entity_Id_1",
-      "target": "Canonical_Entity_Id_2",
-      "relation_type": "RELATION_NAME_UPPERCASE",
-      "description": "Short explanation of the relation",
+  "relationships": [
+    {{
+      "source": "Sundar_Pichai",
+      "relation_type": "LEADS",
+      "target": "Google",
+      "description": "Sundar Pichai serves as CEO of Google",
       "weight": 1.0
-    }
+    }}
   ]
-}
+}}
+
+Respond ONLY with a valid JSON object matching this structure.
 
 Text to analyze:
 {text}
 """
 
 
-class EntityRelationExtractor:
-    """Extractor for entities and relationships using LLM structured output with fallback."""
+from src.utils.llm_client import LLMClient, extract_json, qualify_model
 
-    def __init__(self, api_key: str = None, model: str = None):
-        self.api_key = api_key or settings.openai_api_key
-        self.model = model or settings.llm_model
-        
-        if self.api_key and self.api_key != "mock-key":
-            self.client = OpenAI(api_key=self.api_key, base_url=settings.openai_base_url)
-        else:
-            self.client = None
+
+class EntityRelationExtractor:
+    """Extractor for entities and relationships supporting Gemini, Groq, Ollama, and OpenAI."""
+
+    def __init__(self, model: str = None):
+        self.model = qualify_model(model)
+        self.llm_client = LLMClient(default_model=self.model)
+
 
     def extract_from_text(self, text: str, source_doc: str = "unknown") -> ExtractionResult:
         """Extract structured entities and relations from a text snippet."""
         if not text.strip():
             return ExtractionResult()
 
-        if self.client:
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    response_format={"type": "json_object"},
-                    messages=[
-                        {"role": "system", "content": "You extract structured knowledge graphs in strict JSON format."},
-                        {"role": "user", "content": EXTRACTION_PROMPT.format(text=text)}
-                    ],
-                    temperature=0.0,
-                )
-                raw_json = response.choices[0].message.content
-                data = json.loads(raw_json)
-                return ExtractionResult.model_validate(data)
-            except Exception as e:
-                logger.warning(f"LLM Extraction failed: {e}. Falling back to rule-based extraction.")
+        try:
+            response = self.llm_client.complete(
+                prompt=EXTRACTION_PROMPT.format(text=text),
+                system_prompt="You extract structured knowledge graphs in strict JSON format.",
+                model=self.model,
+                temperature=0.0,
+                max_tokens=512,
+            )
+            data = extract_json(response)
+            if data is None:
+                raise ValueError("no valid JSON object in LLM response")
+            extraction = ExtractionResult.model_validate(data)
+
+            # Reconcile entity name/id aliases between relations and entities
+            return self._reconcile_and_link(extraction, source_doc)
+        except Exception as e:
+            logger.info(f"LLM extraction notice ({e}). Falling back to zero-cost heuristic extraction.")
 
         return self._heuristic_fallback_extraction(text, source_doc)
+
+    def _reconcile_and_link(self, extraction: ExtractionResult, source_doc: str) -> ExtractionResult:
+        """Harmonizes relation endpoints with entity IDs, matching lowercase and title variants."""
+        entities_by_id = {e.id: e for e in extraction.entities}
+        name_to_id = {}
+        for e in extraction.entities:
+            name_to_id[e.id.lower()] = e.id
+            name_to_id[e.name.lower()] = e.id
+            name_to_id[e.id.replace("_", " ").lower()] = e.id
+            name_to_id[e.name.replace(" ", "_").lower()] = e.id
+
+        reconciled_relations: List[Relation] = []
+        for rel in extraction.relations:
+            src_key = rel.source.strip()
+            tgt_key = rel.target.strip()
+            if not src_key or not tgt_key or src_key == tgt_key:
+                continue
+
+            resolved_src = name_to_id.get(src_key.lower()) or name_to_id.get(src_key.replace(" ", "_").lower()) or src_key
+            resolved_tgt = name_to_id.get(tgt_key.lower()) or name_to_id.get(tgt_key.replace(" ", "_").lower()) or tgt_key
+
+            # Synthesize missing endpoint entities if LLM discovered a relation without declaring node
+            if resolved_src not in entities_by_id:
+                new_e = Entity(id=resolved_src, name=resolved_src.replace("_", " ").title(), type="CONCEPT", description=f"Referenced in {source_doc}")
+                entities_by_id[resolved_src] = new_e
+                name_to_id[resolved_src.lower()] = resolved_src
+
+            if resolved_tgt not in entities_by_id:
+                new_e = Entity(id=resolved_tgt, name=resolved_tgt.replace("_", " ").title(), type="CONCEPT", description=f"Referenced in {source_doc}")
+                entities_by_id[resolved_tgt] = new_e
+                name_to_id[resolved_tgt.lower()] = resolved_tgt
+
+            reconciled_relations.append(Relation(
+                source=resolved_src,
+                target=resolved_tgt,
+                relation_type=rel.relation_type,
+                description=rel.description,
+                weight=rel.weight
+            ))
+
+        return ExtractionResult(
+            entities=list(entities_by_id.values()),
+            relations=reconciled_relations
+        )
 
     def _heuristic_fallback_extraction(self, text: str, source_doc: str) -> ExtractionResult:
         """Rule-based extractor fallback when LLM is unavailable."""
@@ -143,9 +194,11 @@ class EntityRelationExtractor:
             )
             concept_notes.append(concept_note)
 
-            # Write concept note to vault file
+            # Write concept note to vault concepts subfolder
+            concepts_dir = vault_dir / "concepts"
+            concepts_dir.mkdir(parents=True, exist_ok=True)
             note_filename = f"concept_{entity.id}.md"
-            note_path = vault_dir / note_filename
+            note_path = concepts_dir / note_filename
             
             frontmatter = {
                 "id": entity.id,

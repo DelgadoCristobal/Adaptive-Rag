@@ -1,9 +1,17 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict
 import logging
 from src.config import settings
 from .schema import Entity, Relation, ExtractionResult
 
 logger = logging.getLogger(__name__)
+
+
+try:
+    import Levenshtein
+    _ratio_fn = Levenshtein.ratio
+except ImportError:
+    import difflib
+    _ratio_fn = lambda s1, s2: difflib.SequenceMatcher(None, s1, s2).ratio()
 
 
 class EntityDeduplicator:
@@ -14,13 +22,7 @@ class EntityDeduplicator:
 
     def calculate_levenshtein_ratio(self, s1: str, s2: str) -> float:
         """Calculate normalized Levenshtein similarity score (0.0 to 1.0)."""
-        try:
-            import Levenshtein
-            return Levenshtein.ratio(s1.lower(), s2.lower())
-        except ImportError:
-            # Fallback simple sequence matcher ratio
-            import difflib
-            return difflib.SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+        return _ratio_fn(s1.lower(), s2.lower())
 
     def deduplicate(self, extraction: ExtractionResult) -> ExtractionResult:
         """Merge duplicate entities and update relation source/target pointers."""

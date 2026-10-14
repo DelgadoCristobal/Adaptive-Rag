@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 try:
@@ -16,17 +15,28 @@ class Settings(BaseSettings):
             extra="ignore"
         )
 
-    # API Configuration
-    openai_api_key: str = "mock-key"
-    openai_base_url: str = "https://api.openai.com/v1"
-    llm_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
+    # LLM & Provider Configuration
+    llm_provider: str = "ollama"  # Options: "gemini", "ollama", "openai", "groq"
+    openai_api_key: str = "ollama-local-key"
+    openai_base_url: str = "http://localhost:11434/v1"
+    ollama_api_base: str = "http://localhost:11434"
+    llm_model: str = "ollama/gemma:2b"
+    embedding_model: str = "all-MiniLM-L6-v2"
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+    # Ollama Hardware & Execution Optimization (RTX 2050 / Local)
+    ollama_num_gpu: int = 99
+    ollama_num_thread: int = 4
+    ollama_num_ctx: int = 2048
+    ollama_num_predict: int = 512
+
 
     # Paths
     base_dir: Path = Path(__file__).resolve().parent.parent
     data_raw_dir: Path = Path("data/raw")
     data_vault_dir: Path = Path("data/vault")
+    data_markdown_dir: Path = Path("data/markdown")
+    data_cache_dir: Path = Path("data/cache")
     kuzu_db_path: Path = Path("db_kuzu")
     chroma_db_path: Path = Path("db_chroma")
 
@@ -34,6 +44,7 @@ class Settings(BaseSettings):
     vector_top_k: int = 5
     graph_hops: int = 2
     rerank_top_k: int = 3
+    rerank_min_score: float = 0.0  # cross-encoder logit floor: weaker candidates are noise, not context
     fuzzy_dedup_threshold: float = 0.85
 
     def resolve_paths(self):
@@ -42,6 +53,10 @@ class Settings(BaseSettings):
             self.data_raw_dir = self.base_dir / self.data_raw_dir
         if not self.data_vault_dir.is_absolute():
             self.data_vault_dir = self.base_dir / self.data_vault_dir
+        if not self.data_markdown_dir.is_absolute():
+            self.data_markdown_dir = self.base_dir / self.data_markdown_dir
+        if not self.data_cache_dir.is_absolute():
+            self.data_cache_dir = self.base_dir / self.data_cache_dir
         if not self.kuzu_db_path.is_absolute():
             self.kuzu_db_path = self.base_dir / self.kuzu_db_path
         if not self.chroma_db_path.is_absolute():
