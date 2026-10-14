@@ -1,37 +1,55 @@
-# Python / Virtual Environment
+# Python bytecode & cache
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-env/
+*.pyc
+*.pyd
+
+# Environments
 venv/
-ENV/
 .venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-# Environment Variables & Credentials
+# Environment Variables & Secrets
 .env
-*.pem
-*.key
+*.env.local
 
-# Data & DB Directories
+# Local heavy data & persistence
 data/raw/*
 !data/raw/.gitkeep
-data/vault/*
-!data/vault/.gitkeep
-db_kuzu/
-db_kuzu
-db_chroma/
-db_chroma
-.kuzu/
-.chroma/
+data/neo4j_data/
+data/neo4j_data/*
+data/chroma_db/
+data/chroma_db/*
+data/processed/*
+!data/processed/.gitkeep
 
-# IDEs & Editors
+# IDEs & OS files
 .vscode/
 .idea/
 *.swp
-*.swo
-
-# OS files
 .DS_Store
 Thumbs.db
+
+# Generated data, local databases and run artifacts
+data/markdown/
+data/cache/
+data/processed/
+data/vault/*
+!data/vault/.gitkeep
+data/crag_benchmark_full.json
+data/eval_dataset.json
+data/eval_checkpoint.*
+data/test_5_samples_ckpt.*
+db_chroma/
+db_kuzu
+scratch/
+scratch_db
+.pytest_cache/
+
+# Local assistant tooling
+.claude/
+.atl/
