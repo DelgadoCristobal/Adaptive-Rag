@@ -292,7 +292,8 @@ def evaluate(
     delay: Optional[float] = typer.Option(None, "--delay", "-d", help="Delay in seconds between LLM calls"),
     model: Optional[str] = typer.Option(None, "--model", "-M", help="LLM model string for generation (e.g. 'ollama/gemma:2b')"),
     judge_model: Optional[str] = typer.Option(None, "--judge-model", "-J", help="LLM model string for evaluation judge (e.g. 'gemini/gemini-3.8-flash')"),
-    no_checkpoint: bool = typer.Option(False, "--no-checkpoint", "--force", "-f", help="Bypass and delete existing checkpoint to force a fresh evaluation from scratch")
+    no_checkpoint: bool = typer.Option(False, "--no-checkpoint", "--force", "-f", help="Bypass and delete existing checkpoint to force a fresh evaluation from scratch"),
+    seed: int = typer.Option(42, "--seed", help="Seed for the per-question naive/hybrid arm order (part of the checkpoint fingerprint)"),
 ):
     """Run automated paired benchmark evaluation (Naive Vector vs Hybrid Adaptive) with statistical inference."""
     from src.evaluation.evaluator import RAGEvaluator
@@ -304,7 +305,8 @@ def evaluate(
 
     console.print(Panel.fit(f"[bold green]Starting Automated RAGAS Paired Evaluation (Generation: {active_model} | Judge: {evaluator.judge_model_name})[/bold green]"))
 
-    results = evaluator.run_paired_benchmark(dataset_path=dataset, max_samples=samples, delay_seconds=delay, no_checkpoint=no_checkpoint)
+    results = evaluator.run_paired_benchmark(dataset_path=dataset, max_samples=samples, delay_seconds=delay, no_checkpoint=no_checkpoint, seed=seed)
+    console.print(f"[bold cyan]Checkpoint saved to: {Path(evaluator.last_checkpoint_path).resolve()}[/bold cyan]")
 
     console.print(f"\n[bold green]Computing inferential statistics for {len(results)} paired observations...[/bold green]")
     report_data = analyzer.generate_full_report(results)

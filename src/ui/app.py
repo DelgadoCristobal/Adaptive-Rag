@@ -732,7 +732,9 @@ with tab_audit:
     st.markdown("Contraste estadístico formal entre **Baseline Vectorial (Control)** y **GraphRAG Híbrido (Tratamiento)** sobre el benchmark oficial **CRAG (Comprehensive RAG Benchmark)**.")
 
     eval_ds_path = settings.base_dir / "data" / "eval_dataset.json"
-    ckpt_path = settings.base_dir / "data" / "eval_checkpoint.json"
+    # Checkpoints are fingerprinted per dataset/config (eval_checkpoint_<fp>.json); show the most recent run.
+    ckpt_candidates = sorted((settings.base_dir / "data").glob("eval_checkpoint*.json"), key=lambda p: p.stat().st_mtime)
+    ckpt_path = ckpt_candidates[-1] if ckpt_candidates else settings.base_dir / "data" / "eval_checkpoint.json"
 
     if eval_ds_path.exists():
         with open(eval_ds_path, "r", encoding="utf-8") as f:
@@ -750,6 +752,8 @@ with tab_audit:
     if ckpt_path.exists():
         with open(ckpt_path, "r", encoding="utf-8") as f:
             bench_data = json.load(f)
+        if isinstance(bench_data, dict):  # fingerprinted format: {"fingerprint", "config", "dataset_ids", "results"}
+            bench_data = bench_data.get("results", [])
 
         if bench_data:
             rep = analyzer.generate_full_report(bench_data)

@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple
+import hashlib
 import json
 import os
 import time
@@ -11,6 +12,7 @@ import pandas as pd
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.console import Console
 
+from src.config import settings
 from src.retrieval.hybrid_engine import HybridRetrievalEngine
 from src.retrieval.router import RetrievalStrategy
 from src.generator.synthesizer import AnswerSynthesizer
@@ -102,6 +104,65 @@ def _retry_delay(error_text: str) -> Optional[float]:
 
 def _norm_id(value: Any) -> str:
     return str(value or "").lower().strip().replace(".md", "")
+
+
+def run_fingerprint(dataset_ids: List[Any], config: Dict[str, Any]) -> str:
+    """First 12 hex chars of the sha256 of the sorted dataset ids plus the run config (canonical JSON)."""
+    payload = json.dumps(
+        {"dataset_ids": sorted(str(i) for i in dataset_ids), "config": config}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def arm_orders(dataset_ids: List[Any], seed: int) -> Dict[Any, str]:
+    """Per-question arm order ("naive_first"/"hybrid_first") from one Random(seed) drawn over the whole dataset.
+
+    Drawing over every id (not only pending ones) keeps each question's order stable across resumed runs.
+    """
+    rng = random.Random(seed)
+    return {q_id: "naive_first" if rng.random() < 0.5 else "hybrid_first" for q_id in dataset_ids}
+
+
+def _free_sibling(path: Path) -> Path:
+    """First `<stem>_<n><suffix>` next to `path` that does not exist yet."""
+    n = 1
+    while (candidate := path.with_name(f"{path.stem}_{n}{path.suffix}")).exists():
+        n += 1
+    return candidate
+
+
+def load_checkpoint(
+    ckpt_file: Path, fingerprint: str, dataset_ids: List[Any], explicit: bool
+) -> Tuple[List[Dict[str, Any]], Path]:
+    """Load resumable rows and decide where this run saves its checkpoint.
+
+    Rows are merged only when the file carries the same fingerprint, and only for ids in the current dataset.
+    A mismatched or legacy (list-format, unverifiable) file is never merged nor overwritten: on an explicit path
+    it raises, otherwise the run starts clean and saves next to it.
+    """
+    if not ckpt_file.exists():
+        return [], ckpt_file
+    try:
+        data = json.loads(ckpt_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Unreadable checkpoint %s (%s); starting clean.", ckpt_file, e)
+        data = None
+
+    stored = data.get("fingerprint") if isinstance(data, dict) else None
+    if stored == fingerprint:
+        allowed = {str(i) for i in dataset_ids}
+        return [r for r in data.get("results", []) if str(r.get("id")) in allowed], ckpt_file
+
+    reason = "legacy/unverifiable format" if stored is None else f"fingerprint {stored} != {fingerprint}"
+    if explicit:
+        raise ValueError(
+            f"Checkpoint {ckpt_file} belongs to a different dataset/config ({reason}). "
+            "Use --no-checkpoint to discard it or choose another checkpoint path."
+        )
+    save_to = _free_sibling(ckpt_file)
+    logger.warning("Checkpoint %s not resumed (%s); starting clean and saving to %s.", ckpt_file, reason, save_to)
+    console.print(f"[bold yellow]Checkpoint {ckpt_file} not resumed ({reason}); saving this run to {save_to}.[/bold yellow]")
+    return [], save_to
 
 
 class RAGEvaluator:
@@ -266,10 +327,32 @@ class RAGEvaluator:
             "answer": answer,
         }
 
+    def _warm_up(self, q_text: str) -> None:
+        """Untimed retrieval+generation through both arms so neither arm absorbs model/index load latency."""
+        for strategy in (RetrievalStrategy.NAIVE_VECTOR, RetrievalStrategy.HYBRID_ADAPTIVE):
+            retrieved, _ = self.hybrid_engine.retrieve(q_text, strategy=strategy)
+            self.synthesizer.synthesize(q_text, retrieved)
+
+    def run_config(self, seed: int = 42) -> Dict[str, Any]:
+        """Everything (besides the dataset ids) that must match for checkpoint rows to be comparable."""
+        cli_binary = getattr(self.cli_judge, "binary", None)
+        return {
+            "arm_order_seed": seed,
+            "generator_model": self.model_name,
+            "judge_backend": f"cli:{Path(cli_binary).stem.lower()}" if cli_binary else "api",
+            "judge_model": self.judge_model_name,
+            "judge_fallbacks": list(self.judge_fallbacks),
+            "vector_top_k": settings.vector_top_k,
+            "rerank_top_k": settings.rerank_top_k,
+        }
+
     @staticmethod
-    def _save_checkpoint(results: List[Dict[str, Any]], ckpt_file: Path) -> None:
-        """Persist the JSON checkpoint and a flat CSV mirror for quick analysis."""
-        ckpt_file.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    def _save_checkpoint(
+        results: List[Dict[str, Any]], ckpt_file: Path, meta: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Persist the JSON checkpoint ({fingerprint, config, dataset_ids, results}) and a flat CSV mirror."""
+        ckpt_file.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_file.write_text(json.dumps({**(meta or {}), "results": results}, indent=2), encoding="utf-8")
         metrics = [("f", "faithfulness"), ("r", "answer_relevance"), ("p", "context_precision")]
         rows = []
         for r in results:
@@ -292,11 +375,16 @@ class RAGEvaluator:
     def run_paired_benchmark(
         self,
         dataset_path: str = "data/eval_dataset.json",
-        checkpoint_path: str = "data/eval_checkpoint.json",
+        checkpoint_path: Optional[str] = None,
         max_samples: Optional[int] = None,
         delay_seconds: Optional[float] = None,
-        no_checkpoint: bool = False
+        no_checkpoint: bool = False,
+        seed: int = 42,
     ) -> List[Dict[str, Any]]:
+        """Run the paired benchmark, resuming only from a checkpoint with the same dataset+config fingerprint.
+
+        The default checkpoint is `data/eval_checkpoint_<fingerprint>.json`; an explicit `checkpoint_path` is used as is.
+        """
         uses_gemini = self.judge_model_name.startswith("gemini/") or self.model_name.startswith("gemini/")
         effective_delay = delay_seconds if delay_seconds is not None else (4.5 if uses_gemini else 0.0)
         with open(dataset_path, "r", encoding="utf-8") as f:
@@ -305,20 +393,34 @@ class RAGEvaluator:
         if max_samples:
             dataset = dataset[:max_samples]
 
-        ckpt_file = Path(checkpoint_path)
+        dataset_ids = [item["id"] for item in dataset]
+        config = self.run_config(seed)
+        orders = arm_orders(dataset_ids, seed)
+        fingerprint = run_fingerprint(dataset_ids, config)
+        meta = {"fingerprint": fingerprint, "config": config, "dataset_ids": dataset_ids}
+        explicit = checkpoint_path is not None
+        ckpt_file = Path(checkpoint_path) if explicit else Path("data") / f"eval_checkpoint_{fingerprint}.json"
+
         if no_checkpoint and ckpt_file.exists():
             ckpt_file.unlink()
             console.print("[bold yellow]Bypassing existing checkpoint (--no-checkpoint active). Starting clean evaluation.[/bold yellow]")
 
         results: List[Dict[str, Any]] = []
-        if not no_checkpoint and ckpt_file.exists():
-            try:
-                results = json.loads(ckpt_file.read_text(encoding="utf-8"))
+        if not no_checkpoint:
+            results, ckpt_file = load_checkpoint(ckpt_file, fingerprint, dataset_ids, explicit)
+            if results:
                 console.print(f"[bold cyan]Resuming from checkpoint ({len(results)}/{len(dataset)} completed)[/bold cyan]")
-            except (OSError, json.JSONDecodeError) as e:
-                logger.warning("Unreadable checkpoint %s (%s); starting clean.", ckpt_file, e)
+        self.last_checkpoint_path = ckpt_file
+        console.print(f"[cyan]Checkpoint: {ckpt_file} (fingerprint {fingerprint})[/cyan]")
 
         processed_ids = {r["id"] for r in results}
+
+        pending = [item for item in dataset if item["id"] not in processed_ids]
+        if pending:
+            try:
+                self._warm_up(pending[0].get("question") or pending[0].get("query", ""))
+            except Exception as warm_err:  # a real failure will surface again (and be handled) in the timed loop
+                logger.warning("Warm-up query failed (%s); continuing without it.", str(warm_err)[:150])
 
         with Progress(
             SpinnerColumn(),
@@ -339,9 +441,14 @@ class RAGEvaluator:
                 q_text = item.get("question") or item.get("query", "")
                 expected_src = item.get("gold_document_ids") or item.get("gold_doc_ids") or item.get("expected_source") or ""
 
+                arm_order = orders[q_id]
                 try:
-                    naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
-                    hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                    if arm_order == "naive_first":
+                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
+                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                    else:
+                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
                 except Exception as sample_err:
                     logger.error("Sample %s failed after retries and fallbacks (%s). Discarding to preserve statistical integrity.", q_id, sample_err)
                     console.print(f"[bold red]Discarding sample {q_id} due to judge failure: {sample_err}[/bold red]")
@@ -355,6 +462,7 @@ class RAGEvaluator:
                     "question": q_text,
                     "ground_truth": item.get("ground_truth") or item.get("answer", ""),
                     "expected_source": expected_src,
+                    "arm_order": arm_order,
                     "naive": naive,
                     "hybrid": hybrid,
                     "delta": {
@@ -366,7 +474,7 @@ class RAGEvaluator:
                     },
                 })
                 processed_ids.add(q_id)
-                self._save_checkpoint(results, ckpt_file)
+                self._save_checkpoint(results, ckpt_file, meta)
                 progress.update(task, advance=1)
 
         return results

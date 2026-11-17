@@ -35,10 +35,10 @@ Out of scope, deferred to later phases: graph extraction quality, Cypher paramet
 ## Tasks
 
 - [x] **T1: Statistics correctness.** Use Wilcoxon signed-rank for every metric, with no Shapiro selection. Use the matched-pairs rank-biserial effect size (Kerby). Make tests two-sided, with a matching two-sided bootstrap CI. Pre-declare each metric's direction in an explicit map. Apply Holm correction across the outcome family. Exclude Top-1 from the outcome family and the conclusions. Remove the hard-coded narrative. Route: delegated writer (statistics module plus tests, with design decisions given).
-- [ ] **T2: Checkpoint keying.** Key the checkpoint by a hash of the dataset ids and the run config. Filter resumed rows to the current dataset ids, and trim them to `--samples`.
+- [x] **T2: Checkpoint keying.** Key the checkpoint by a hash of the dataset ids and the run config. Filter resumed rows to the current dataset ids, and trim them to `--samples`.
 - [ ] **T3: Judge context alignment.** The synthesizer returns the exact context block it used, and faithfulness is judged against that block.
 - [ ] **T4: Correctness judge.** Judge the answer against `ground_truth` (correct / missing / hallucinated, CRAG-style) and add it to the outcome family.
-- [ ] **T5: Arm order.** Randomise the naive/hybrid order per question with a seed, and add a warm-up query before timing.
+- [x] **T5: Arm order.** Randomise the naive/hybrid order per question with a seed, and add a warm-up query before timing.
 
 ## Acceptance criteria
 
@@ -55,13 +55,31 @@ Baseline before the work: 23 passed (audit run).
 
 ## Delivery
 
-Strategy: `ask-on-risk`. The forecast is about 600 authored lines across T1-T5, which is over the 400 budget, so the chain strategy will be asked before the commit that crosses it.
+Strategy: `ask-on-risk`. Chain strategy: **stacked-to-main**, chosen by the user on 2026-11-17.
+
+Each branch is stacked on the one before it:
+
+```
+master ← feat/crag-40-eval-report ← feat/eval-validity (T1) ← feat/eval-checkpoint (T2+T5) ← feat/eval-judges (T3+T4)
+```
+
+| Slice | Branch | Tasks | Commits |
+|---|---|---|---|
+| 1 | feat/eval-validity | T1 | b64c543 |
+| 2 | feat/eval-checkpoint | T2, T5 | 65931c6, bef7f09, plus the UI checkpoint fix |
+| 3 | feat/eval-judges | T3, T4 | — |
+
+T2 and T5 are grouped because both change the `run` loop in `evaluator.py`, and the arm-order seed must be part of the checkpoint fingerprint. T3 and T4 are grouped because both change the judge prompts and the synthesizer contract.
+
+Push and PR creation remain the user's decision.
 
 ## Progress
 
 | Task | Route | Commit | Checks | Review |
 |---|---|---|---|---|
-| T1 | delegated writer (statistics module plus tests) | see git log `fix(evaluation): ...statistics` | RED: ImportError, 1 failed, then the constant-Δ test failed. GREEN: offline suite 35 passed, 2 deselected | pending assess |
+| T1 | delegated writer (statistics module plus tests) | see git log `fix(evaluation): ...statistics` | RED: ImportError, 1 failed, then the constant-Δ test failed. GREEN: offline suite 35 passed, 2 deselected | assess: risk medium; review_due false (under_budget), so the slice stays pending |
+
+Commit: b64c543. The running count after T1 is 460 changed lines, over the budget, so the chain strategy must be decided before the T2 commit.
 
 T1 notes:
 - `is_significant` inside `generate_full_report` now uses the Holm-adjusted p. A standalone `analyze_metric` call uses the raw p.
@@ -71,6 +89,17 @@ T1 notes:
 
 Accepted limitation: Holm is computed on p rounded to 5 decimals, so the error is at most about 1e-5.
 
+| T2 | delegated writer | 65931c6 | RED: ImportError on `load_checkpoint`. GREEN: 9 tests in `test_evaluator_run.py`; offline suite 44 passed | — |
+| T5 | delegated writer | bef7f09 | RED: 4 failed. GREEN: offline suite 48 passed, 2 deselected | — |
+
+T2 and T5 notes:
+- The default checkpoint is now `data/eval_checkpoint_<fp>.json`. The fingerprint covers the sorted dataset ids (after `--samples`), `arm_order_seed`, `generator_model`, `judge_backend`, `judge_model`, `judge_fallbacks`, `vector_top_k` and `rerank_top_k`.
+- A mismatched or legacy checkpoint is never merged or overwritten. On the default path the run starts clean at `<stem>_<n>.json`; on an explicit path it raises `ValueError`.
+- Each row gets an `arm_order` field, and `main.py evaluate` gains `--seed`.
+- Latency is not comparable with earlier runs.
+- Parent fix: `src/ui/app.py` hard-coded `data/eval_checkpoint.json`. It now loads the newest `eval_checkpoint*.json` and unwraps `results`. Checked with `py_compile` and a temp-dir script.
+- Declined, YAGNI: a `--checkpoint` CLI flag.
+
 ## Next step
 
-T2.
+Slice 2 assess/review, then slice 3 (T3+T4) on feat/eval-judges.
