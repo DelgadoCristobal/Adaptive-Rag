@@ -1,4 +1,5 @@
 from typing import List, Dict, Any, Optional, Tuple
+import hashlib
 import json
 import os
 import time
@@ -11,6 +12,7 @@ import pandas as pd
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.console import Console
 
+from src.config import settings
 from src.retrieval.hybrid_engine import HybridRetrievalEngine
 from src.retrieval.router import RetrievalStrategy
 from src.generator.synthesizer import AnswerSynthesizer
@@ -102,6 +104,56 @@ def _retry_delay(error_text: str) -> Optional[float]:
 
 def _norm_id(value: Any) -> str:
     return str(value or "").lower().strip().replace(".md", "")
+
+
+def run_fingerprint(dataset_ids: List[Any], config: Dict[str, Any]) -> str:
+    """First 12 hex chars of the sha256 of the sorted dataset ids plus the run config (canonical JSON)."""
+    payload = json.dumps(
+        {"dataset_ids": sorted(str(i) for i in dataset_ids), "config": config}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def _free_sibling(path: Path) -> Path:
+    """First `<stem>_<n><suffix>` next to `path` that does not exist yet."""
+    n = 1
+    while (candidate := path.with_name(f"{path.stem}_{n}{path.suffix}")).exists():
+        n += 1
+    return candidate
+
+
+def load_checkpoint(
+    ckpt_file: Path, fingerprint: str, dataset_ids: List[Any], explicit: bool
+) -> Tuple[List[Dict[str, Any]], Path]:
+    """Load resumable rows and decide where this run saves its checkpoint.
+
+    Rows are merged only when the file carries the same fingerprint, and only for ids in the current dataset.
+    A mismatched or legacy (list-format, unverifiable) file is never merged nor overwritten: on an explicit path
+    it raises, otherwise the run starts clean and saves next to it.
+    """
+    if not ckpt_file.exists():
+        return [], ckpt_file
+    try:
+        data = json.loads(ckpt_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Unreadable checkpoint %s (%s); starting clean.", ckpt_file, e)
+        data = None
+
+    stored = data.get("fingerprint") if isinstance(data, dict) else None
+    if stored == fingerprint:
+        allowed = {str(i) for i in dataset_ids}
+        return [r for r in data.get("results", []) if str(r.get("id")) in allowed], ckpt_file
+
+    reason = "legacy/unverifiable format" if stored is None else f"fingerprint {stored} != {fingerprint}"
+    if explicit:
+        raise ValueError(
+            f"Checkpoint {ckpt_file} belongs to a different dataset/config ({reason}). "
+            "Use --no-checkpoint to discard it or choose another checkpoint path."
+        )
+    save_to = _free_sibling(ckpt_file)
+    logger.warning("Checkpoint %s not resumed (%s); starting clean and saving to %s.", ckpt_file, reason, save_to)
+    console.print(f"[bold yellow]Checkpoint {ckpt_file} not resumed ({reason}); saving this run to {save_to}.[/bold yellow]")
+    return [], save_to
 
 
 class RAGEvaluator:
@@ -266,10 +318,25 @@ class RAGEvaluator:
             "answer": answer,
         }
 
+    def run_config(self) -> Dict[str, Any]:
+        """Everything (besides the dataset ids) that must match for checkpoint rows to be comparable."""
+        cli_binary = getattr(self.cli_judge, "binary", None)
+        return {
+            "generator_model": self.model_name,
+            "judge_backend": f"cli:{Path(cli_binary).stem.lower()}" if cli_binary else "api",
+            "judge_model": self.judge_model_name,
+            "judge_fallbacks": list(self.judge_fallbacks),
+            "vector_top_k": settings.vector_top_k,
+            "rerank_top_k": settings.rerank_top_k,
+        }
+
     @staticmethod
-    def _save_checkpoint(results: List[Dict[str, Any]], ckpt_file: Path) -> None:
-        """Persist the JSON checkpoint and a flat CSV mirror for quick analysis."""
-        ckpt_file.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    def _save_checkpoint(
+        results: List[Dict[str, Any]], ckpt_file: Path, meta: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Persist the JSON checkpoint ({fingerprint, config, dataset_ids, results}) and a flat CSV mirror."""
+        ckpt_file.parent.mkdir(parents=True, exist_ok=True)
+        ckpt_file.write_text(json.dumps({**(meta or {}), "results": results}, indent=2), encoding="utf-8")
         metrics = [("f", "faithfulness"), ("r", "answer_relevance"), ("p", "context_precision")]
         rows = []
         for r in results:
@@ -292,11 +359,15 @@ class RAGEvaluator:
     def run_paired_benchmark(
         self,
         dataset_path: str = "data/eval_dataset.json",
-        checkpoint_path: str = "data/eval_checkpoint.json",
+        checkpoint_path: Optional[str] = None,
         max_samples: Optional[int] = None,
         delay_seconds: Optional[float] = None,
         no_checkpoint: bool = False
     ) -> List[Dict[str, Any]]:
+        """Run the paired benchmark, resuming only from a checkpoint with the same dataset+config fingerprint.
+
+        The default checkpoint is `data/eval_checkpoint_<fingerprint>.json`; an explicit `checkpoint_path` is used as is.
+        """
         uses_gemini = self.judge_model_name.startswith("gemini/") or self.model_name.startswith("gemini/")
         effective_delay = delay_seconds if delay_seconds is not None else (4.5 if uses_gemini else 0.0)
         with open(dataset_path, "r", encoding="utf-8") as f:
@@ -305,18 +376,24 @@ class RAGEvaluator:
         if max_samples:
             dataset = dataset[:max_samples]
 
-        ckpt_file = Path(checkpoint_path)
+        dataset_ids = [item["id"] for item in dataset]
+        config = self.run_config()
+        fingerprint = run_fingerprint(dataset_ids, config)
+        meta = {"fingerprint": fingerprint, "config": config, "dataset_ids": dataset_ids}
+        explicit = checkpoint_path is not None
+        ckpt_file = Path(checkpoint_path) if explicit else Path("data") / f"eval_checkpoint_{fingerprint}.json"
+
         if no_checkpoint and ckpt_file.exists():
             ckpt_file.unlink()
             console.print("[bold yellow]Bypassing existing checkpoint (--no-checkpoint active). Starting clean evaluation.[/bold yellow]")
 
         results: List[Dict[str, Any]] = []
-        if not no_checkpoint and ckpt_file.exists():
-            try:
-                results = json.loads(ckpt_file.read_text(encoding="utf-8"))
+        if not no_checkpoint:
+            results, ckpt_file = load_checkpoint(ckpt_file, fingerprint, dataset_ids, explicit)
+            if results:
                 console.print(f"[bold cyan]Resuming from checkpoint ({len(results)}/{len(dataset)} completed)[/bold cyan]")
-            except (OSError, json.JSONDecodeError) as e:
-                logger.warning("Unreadable checkpoint %s (%s); starting clean.", ckpt_file, e)
+        self.last_checkpoint_path = ckpt_file
+        console.print(f"[cyan]Checkpoint: {ckpt_file} (fingerprint {fingerprint})[/cyan]")
 
         processed_ids = {r["id"] for r in results}
 
@@ -366,7 +443,7 @@ class RAGEvaluator:
                     },
                 })
                 processed_ids.add(q_id)
-                self._save_checkpoint(results, ckpt_file)
+                self._save_checkpoint(results, ckpt_file, meta)
                 progress.update(task, advance=1)
 
         return results

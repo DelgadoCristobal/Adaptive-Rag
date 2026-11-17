@@ -305,6 +305,7 @@ def evaluate(
     console.print(Panel.fit(f"[bold green]Starting Automated RAGAS Paired Evaluation (Generation: {active_model} | Judge: {evaluator.judge_model_name})[/bold green]"))
 
     results = evaluator.run_paired_benchmark(dataset_path=dataset, max_samples=samples, delay_seconds=delay, no_checkpoint=no_checkpoint)
+    console.print(f"[bold cyan]Checkpoint saved to: {Path(evaluator.last_checkpoint_path).resolve()}[/bold cyan]")
 
     console.print(f"\n[bold green]Computing inferential statistics for {len(results)} paired observations...[/bold green]")
     report_data = analyzer.generate_full_report(results)
