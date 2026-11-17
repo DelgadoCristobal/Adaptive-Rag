@@ -36,14 +36,17 @@ def test_zero_variance_yields_p_one():
     assert res["p_value"] == 1.0 and not res["is_significant"] and res["variance_note"]
 
 
-def test_alternative_direction():
+def test_tests_are_two_sided_and_direction_only_interprets():
     az = StatisticalAnalyzer()
     naive = [0.1, 0.2, 0.3, 0.2, 0.4, 0.1, 0.3]
-    better = [x + 0.2 + 0.01 * i for i, x in enumerate(naive)]
-    assert az.analyze_metric(naive, better, "Faithfulness")["alternative"] == "greater"
-    assert az.analyze_metric(naive, better, "Faithfulness")["is_significant"]
-    assert az.analyze_metric(naive, better, "Latency (ms)")["alternative"] == "less"
-    assert not az.analyze_metric(naive, better, "Latency (ms)")["is_significant"]
+    higher = [x + 0.2 + 0.01 * i for i, x in enumerate(naive)]
+    faith = az.analyze_metric(naive, higher, "Faithfulness")
+    latency = az.analyze_metric(naive, higher, "Latency (ms)")
+    assert faith["alternative"] == latency["alternative"] == "two-sided"
+    # Same two-sided p-value regardless of direction; direction only decides which arm is better.
+    assert faith["p_value"] == latency["p_value"] and faith["is_significant"]
+    assert faith["improved"] and faith["better_arm"] == "hybrid"
+    assert not latency["improved"] and latency["better_arm"] == "naive"
 
 
 def test_retry_delay_parses_compound_durations():
