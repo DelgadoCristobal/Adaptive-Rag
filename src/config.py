@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     ollama_num_ctx: int = 2048
     ollama_num_predict: int = 512
 
+    # Graph extraction: each document is split into chunks of at most this many characters,
+    # and each chunk gets at most this many output tokens. For Ollama models the chunk size is
+    # shrunk automatically when prompt + chunk + output would not fit in ollama_num_ctx.
+    extraction_chunk_chars: int = 1500
+    extraction_max_tokens: int = 1024
 
     # Paths
     base_dir: Path = Path(__file__).resolve().parent.parent

@@ -58,6 +58,78 @@ Text to analyze:
 
 from src.utils.llm_client import LLMClient, extract_json, qualify_model
 
+SYSTEM_PROMPT = "You extract structured knowledge graphs in strict JSON format."
+CHARS_PER_TOKEN = 4  # rough estimate, good enough to keep a call inside num_ctx
+MIN_CHUNK_CHARS = 200
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def effective_chunk_chars(chunk_chars: int, max_tokens: int, num_ctx: int, prompt_chars: int) -> int:
+    """Largest chunk size (chars) such that prompt + chunk + output fit in num_ctx tokens."""
+    available_tokens = num_ctx - max_tokens - prompt_chars // CHARS_PER_TOKEN
+    return max(MIN_CHUNK_CHARS, min(chunk_chars, available_tokens * CHARS_PER_TOKEN))
+
+
+def _pack(pieces: List[str], max_chars: int, sep: str) -> List[str]:
+    """Greedily join consecutive pieces with sep while the result stays within max_chars."""
+    packed: List[str] = []
+    current = ""
+    for piece in pieces:
+        candidate = f"{current}{sep}{piece}" if current else piece
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                packed.append(current)
+            current = piece
+    if current:
+        packed.append(current)
+    return packed
+
+
+def split_into_chunks(text: str, max_chars: int) -> List[str]:
+    """Split text into chunks of at most max_chars, preferring paragraph, then sentence boundaries."""
+    units: List[str] = []
+    for paragraph in (p.strip() for p in re.split(r"\n\s*\n", text)):
+        if not paragraph:
+            continue
+        if len(paragraph) <= max_chars:
+            units.append(paragraph)
+            continue
+        sentences: List[str] = []
+        for sentence in _SENTENCE_END_RE.split(paragraph):
+            sentences.extend(sentence[i:i + max_chars] for i in range(0, len(sentence), max_chars))
+        units.extend(_pack(sentences, max_chars, " "))
+    return _pack(units, max_chars, "\n\n")
+
+
+def _merge_extractions(results: List[ExtractionResult]) -> ExtractionResult:
+    """Union chunk results: entities by normalized id, relations by (source, target, type)."""
+    entities: Dict[str, Entity] = {}
+    relations: Dict[tuple, Relation] = {}
+    for result in results:
+        for ent in result.entities:
+            key = ent.id.lower()
+            kept = entities.get(key)
+            if kept is None:
+                entities[key] = ent.model_copy(deep=True)
+                continue
+            kept.name = kept.name or ent.name
+            kept.type = kept.type or ent.type
+            if len(ent.description) > len(kept.description):
+                kept.description = ent.description
+            kept.aliases = list(dict.fromkeys(kept.aliases + ent.aliases))
+        for rel in result.relations:
+            key = (rel.source.lower(), rel.target.lower(), rel.relation_type)
+            kept = relations.get(key)
+            if kept is None:
+                relations[key] = rel.model_copy(deep=True)
+                continue
+            if len(rel.description) > len(kept.description):
+                kept.description = rel.description
+            kept.weight = max(kept.weight, rel.weight)
+    return ExtractionResult(entities=list(entities.values()), relations=list(relations.values()))
+
 
 class EntityRelationExtractor:
     """Extractor for entities and relationships supporting Gemini, Groq, Ollama, and OpenAI."""
@@ -66,31 +138,64 @@ class EntityRelationExtractor:
         self.model = qualify_model(model)
         self.llm_client = LLMClient(default_model=self.model)
 
+    def _chunk_chars(self) -> int:
+        """Configured chunk size, shrunk once (with a WARNING) when an Ollama call would overflow num_ctx."""
+        cached = getattr(self, "_cached_chunk_chars", None)
+        if cached is not None:
+            return cached
+        configured = settings.extraction_chunk_chars
+        chunk_chars = configured
+        if str(self.model).startswith("ollama/"):
+            num_ctx = int(getattr(self.llm_client, "num_ctx", settings.ollama_num_ctx))
+            chunk_chars = effective_chunk_chars(
+                configured, settings.extraction_max_tokens, num_ctx,
+                prompt_chars=len(EXTRACTION_PROMPT) + len(SYSTEM_PROMPT),
+            )
+            if chunk_chars < configured:
+                logger.warning(
+                    "extraction_chunk_chars=%d with extraction_max_tokens=%d does not fit num_ctx=%d; "
+                    "using %d chars per chunk", configured, settings.extraction_max_tokens, num_ctx, chunk_chars,
+                )
+        self._cached_chunk_chars = chunk_chars
+        return chunk_chars
+
+    def _extract_chunk(self, chunk: str, source_doc: str) -> ExtractionResult:
+        response = self.llm_client.complete(
+            prompt=EXTRACTION_PROMPT.format(text=chunk),
+            system_prompt=SYSTEM_PROMPT,
+            model=self.model,
+            temperature=0.0,
+            max_tokens=settings.extraction_max_tokens,
+        )
+        data = extract_json(response)
+        if data is None:
+            raise ValueError("no valid JSON object in LLM response")
+        return ExtractionResult.model_validate(data)
 
     def extract_from_text(self, text: str, source_doc: str = "unknown") -> ExtractionResult:
-        """Extract structured entities and relations from a text snippet."""
+        """Extract entities and relations chunk by chunk; a failed chunk is logged, counted and contributes nothing."""
         if not text.strip():
             return ExtractionResult()
 
-        try:
-            response = self.llm_client.complete(
-                prompt=EXTRACTION_PROMPT.format(text=text),
-                system_prompt="You extract structured knowledge graphs in strict JSON format.",
-                model=self.model,
-                temperature=0.0,
-                max_tokens=512,
-            )
-            data = extract_json(response)
-            if data is None:
-                raise ValueError("no valid JSON object in LLM response")
-            extraction = ExtractionResult.model_validate(data)
+        chunks = split_into_chunks(text, self._chunk_chars())
+        results: List[ExtractionResult] = []
+        failed = 0
+        for index, chunk in enumerate(chunks, start=1):
+            try:
+                results.append(self._extract_chunk(chunk, source_doc))
+            except Exception as e:
+                failed += 1
+                logger.warning("Extraction failed for %s chunk %d/%d: %s", source_doc, index, len(chunks), e)
 
-            # Reconcile entity name/id aliases between relations and entities
-            return self._reconcile_and_link(extraction, source_doc)
-        except Exception as e:
-            logger.info(f"LLM extraction notice ({e}). Falling back to zero-cost heuristic extraction.")
+        if failed == len(chunks):
+            logger.warning("Extraction produced nothing for %s: all %d chunks failed", source_doc, len(chunks))
+            return ExtractionResult(chunks_total=len(chunks), chunks_failed=failed)
 
-        return self._heuristic_fallback_extraction(text, source_doc)
+        # Reconcile entity name/id aliases between relations and entities, once over the merged result
+        merged = self._reconcile_and_link(_merge_extractions(results), source_doc)
+        merged.chunks_total = len(chunks)
+        merged.chunks_failed = failed
+        return merged
 
     def _reconcile_and_link(self, extraction: ExtractionResult, source_doc: str) -> ExtractionResult:
         """Harmonizes relation endpoints with entity IDs, matching lowercase and title variants."""
@@ -135,42 +240,6 @@ class EntityRelationExtractor:
             entities=list(entities_by_id.values()),
             relations=reconciled_relations
         )
-
-    def _heuristic_fallback_extraction(self, text: str, source_doc: str) -> ExtractionResult:
-        """Rule-based extractor fallback when LLM is unavailable."""
-        entities: Dict[str, Entity] = {}
-        relations: List[Relation] = []
-
-        # Find capitalized terms/phrases as potential entities
-        candidates = set(re.findall(r'\b[A-Z][a-zA-Z0-9_\-]{2,}\b', text))
-        ignored = {"The", "This", "That", "With", "From", "Have", "Were", "Been", "Which", "Their", "Where", "When", "Slide", "Notes", "Error"}
-        candidates = candidates - ignored
-
-        for cand in candidates:
-            ent_id = cand.replace(" ", "_")
-            entities[ent_id] = Entity(
-                id=ent_id,
-                name=cand,
-                type="CONCEPT",
-                description=f"Extracted concept from {source_doc}",
-                aliases=[cand]
-            )
-
-        # Simple co-occurrence relations between consecutive candidates
-        cand_list = list(candidates)
-        for i in range(len(cand_list) - 1):
-            src = cand_list[i].replace(" ", "_")
-            tgt = cand_list[i+1].replace(" ", "_")
-            if src != tgt:
-                relations.append(Relation(
-                    source=src,
-                    target=tgt,
-                    relation_type="ASSOCIATED_WITH",
-                    description=f"Co-occurs in {source_doc}",
-                    weight=0.8
-                ))
-
-        return ExtractionResult(entities=list(entities.values()), relations=relations)
 
     def create_atomic_concept_notes(
         self, extraction: ExtractionResult, source_doc: str, vault_dir: Path = None

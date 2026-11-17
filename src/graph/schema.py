@@ -129,6 +129,8 @@ class ExtractionResult(BaseModel):
     """Structured extraction output from LLM for a text chunk or document."""
     entities: List[Entity] = Field(default_factory=list, description="List of extracted entities")
     relations: List[Relation] = Field(default_factory=list, description="List of extracted relations")
+    chunks_total: int = Field(default=0, description="Number of text chunks sent to the extractor")
+    chunks_failed: int = Field(default=0, description="Chunks whose extraction failed and contributed nothing")
 
     @model_validator(mode="before")
     @classmethod
