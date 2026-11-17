@@ -1,8 +1,10 @@
-"""Offline tests for the judges: the faithfulness judge sees the generator's exact context.
+"""Offline tests for the judges: faithfulness sees the generator's exact context; CRAG-style correctness.
 
 No real LLM, retrieval engine or model is constructed: fakes replace them.
 """
-from src.evaluation.evaluator import RAGEvaluator
+import pytest
+
+from src.evaluation.evaluator import CORRECTNESS_SCORES, RAGEvaluator, parse_correctness_label
 from src.generator.synthesizer import SYNTHESIS_SYSTEM_PROMPT, AnswerSynthesizer, build_context_block
 from src.retrieval.router import RetrievalStrategy
 
@@ -80,6 +82,7 @@ def make_evaluator():
     e.judged_contexts = []
     e.evaluate_faithfulness = lambda context, answer: (e.judged_contexts.append(context), (1.0, "ok"))[1]
     e.evaluate_relevance = lambda question, answer: (1.0, "ok")
+    e.evaluate_correctness = lambda question, ground_truth, answer: (1.0, "correct")
     return e
 
 
@@ -105,3 +108,57 @@ def test_faithfulness_prompt_is_not_cut_to_2000_chars():
     context = "x" * 3000 + "TAIL"
     e.evaluate_faithfulness(context, "some answer")
     assert "TAIL" in seen[0]
+
+
+# --- T4: CRAG-style correctness judge ---------------------------------------------------------------
+
+@pytest.mark.parametrize("reply, expected", [
+    ('{"label": "correct"}', "correct"),
+    ('```json\n{"label": "Missing"}\n```', "missing"),
+    ('Verdict: {"label": " incorrect ", "reason": "wrong year"}', "incorrect"),
+    ("", None),
+    ("correct", None),
+    ('{"label": "partially correct"}', None),
+    ('{"label": "hallucinated"}', None),
+    ('{"verdict": "correct"}', None),
+    ('{"label": "correct"', None),
+    ('{"label": 1}', None),
+])
+def test_parse_correctness_label_is_strict(reply, expected):
+    assert parse_correctness_label(reply) == expected
+
+
+def test_correctness_score_mapping_follows_crag():
+    assert CORRECTNESS_SCORES == {"correct": 1.0, "missing": 0.0, "incorrect": -1.0}
+
+
+def judge_evaluator(reply):
+    e = RAGEvaluator.__new__(RAGEvaluator)
+    e.prompts = []
+    e._call_judge_with_retry = lambda prompt, system_prompt: (e.prompts.append(prompt), reply)[1]
+    return e
+
+
+@pytest.mark.parametrize("reply, expected", [
+    ('{"label": "correct"}', (1.0, "correct")),
+    ('{"label": "missing"}', (0.0, "missing")),
+    ('{"label": "incorrect"}', (-1.0, "incorrect")),
+])
+def test_evaluate_correctness_scores_the_label_and_shows_ground_truth(reply, expected):
+    e = judge_evaluator(reply)
+    assert e.evaluate_correctness("Who?", "Ada Lovelace", "It was Ada [1].") == expected
+    assert "Ada Lovelace" in e.prompts[0] and "It was Ada [1]." in e.prompts[0] and "Who?" in e.prompts[0]
+
+
+def test_malformed_correctness_reply_is_none_not_zero(caplog):
+    e = judge_evaluator("I think it's fine")
+    with caplog.at_level("WARNING"):
+        assert e.evaluate_correctness("Who?", "Ada", "Ada") == (None, None)
+    assert "correctness" in caplog.text.lower()
+
+
+def test_missing_ground_truth_is_none_and_skips_the_judge(caplog):
+    e = judge_evaluator('{"label": "correct"}')
+    with caplog.at_level("WARNING"):
+        assert e.evaluate_correctness("Who?", "", "Ada") == (None, None)
+    assert e.prompts == [] and "ground_truth" in caplog.text

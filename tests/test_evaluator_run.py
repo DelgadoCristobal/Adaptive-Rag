@@ -43,6 +43,10 @@ def make_evaluator():
     e.synthesizer = FakeSynth()
     e.evaluate_faithfulness = lambda context, answer: (1.0, "ok")
     e.evaluate_relevance = lambda question, answer: (1.0, "ok")
+    e.correctness_calls = []
+    e.evaluate_correctness = lambda question, ground_truth, answer: (
+        e.correctness_calls.append(ground_truth), (1.0, "correct") if ground_truth else (None, None)
+    )[1]
     return e
 
 
@@ -190,3 +194,33 @@ def test_warm_up_runs_once_before_timed_calls_and_only_when_pending(tmp_path):
     e2 = make_evaluator()
     e2.run_paired_benchmark(dataset_path=str(dataset), checkpoint_path=str(ckpt), delay_seconds=0)
     assert e2.calls == []  # nothing pending: no warm-up
+
+
+# --- T4: correctness keys and metrics version --------------------------------------------------------
+
+def test_rows_carry_correctness_keys_and_keep_existing_ones(tmp_path):
+    dataset = tmp_path / "dataset.json"
+    dataset.write_text(json.dumps([
+        {"id": "q0", "question": "question 0", "ground_truth": "gt 0"},
+        {"id": "q1", "question": "question 1"},
+    ]), encoding="utf-8")
+    e = make_evaluator()
+    results = e.run_paired_benchmark(dataset_path=str(dataset), checkpoint_path=str(tmp_path / "c.json"), delay_seconds=0)
+    first, second = results
+    for r in results:
+        assert {"id", "type", "domain", "question", "ground_truth", "expected_source", "arm_order",
+                "naive", "hybrid", "delta"} <= set(r)
+        assert {"correctness_naive", "correctness_hybrid", "correctness_label_naive", "correctness_label_hybrid"} <= set(r)
+    assert (first["correctness_naive"], first["correctness_label_hybrid"]) == (1.0, "correct")
+    assert first["naive"]["correctness"] == 1.0 and first["delta"]["correctness"] == 0.0
+    assert second["correctness_naive"] is None and second["correctness_label_naive"] is None
+    assert second["delta"]["correctness"] is None
+    assert e.correctness_calls == ["gt 0", "gt 0", "", ""]
+
+
+def test_metrics_version_is_part_of_the_fingerprint():
+    e = make_evaluator()
+    config = e.run_config()
+    assert config["metrics_version"] == ev.METRICS_VERSION >= 2
+    legacy = {k: v for k, v in config.items() if k != "metrics_version"}
+    assert run_fingerprint(["q0"], config) != run_fingerprint(["q0"], legacy)
