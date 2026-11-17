@@ -27,6 +27,9 @@ class FakeSynth:
     def synthesize(self, query, retrieved):
         return {"answer": f"answer to {query}"}
 
+    def context_block(self, items):
+        return "\n\n".join(i.get("text", "") for i in items)
+
 
 def make_evaluator():
     """A RAGEvaluator with no real engine, synthesizer or judge."""

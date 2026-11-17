@@ -23,12 +23,33 @@ CHARS_PER_TOKEN = 3
 PROMPT_OVERHEAD_TOKENS = 350
 
 
+def build_context_block(items: List[Dict[str, Any]], window_tokens: int) -> str:
+    """The exact numbered context block the generator puts in its prompt (pure and deterministic).
+
+    The context budget (`window_tokens`) is split evenly across items, with at least 300 chars per item.
+    """
+    if not items:
+        return ""
+    per_item_chars = max(300, window_tokens * CHARS_PER_TOKEN // len(items))
+    return "\n\n".join(
+        f"[{idx}] Source ({item.get('source', f'ref_{idx}')}): {item.get('text', '')[:per_item_chars]}"
+        for idx, item in enumerate(items, start=1)
+    )
+
+
 class AnswerSynthesizer:
     """Grounded answer generation engine supporting Gemini, Groq, Ollama, and OpenAI."""
 
     def __init__(self, model: str = None):
         self.model = qualify_model(model)
         self.llm_client = LLMClient(default_model=self.model)
+
+    def context_block(self, items: List[Dict[str, Any]]) -> str:
+        """The context block `synthesize` sends to the LLM for these items (also used to judge faithfulness)."""
+        # Ollama truncates overlong prompts from the START (dropping the instructions), so the context must
+        # fit in num_ctx minus the tokens reserved for generation and prompt scaffolding.
+        window = self.llm_client.num_ctx - self.llm_client.num_predict - PROMPT_OVERHEAD_TOKENS
+        return build_context_block(items, window)
 
     def synthesize(self, query: str, retrieved_contexts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generate answer with graph and document citations."""
@@ -38,20 +59,11 @@ class AnswerSynthesizer:
                 "citations": []
             }
 
-        # Ollama truncates overlong prompts from the START (dropping the instructions), so the context must
-        # fit in num_ctx minus the tokens reserved for generation and prompt scaffolding.
-        window = self.llm_client.num_ctx - self.llm_client.num_predict - PROMPT_OVERHEAD_TOKENS
-        per_item_chars = max(300, window * CHARS_PER_TOKEN // len(retrieved_contexts))
-
-        context_lines = []
-        citations = []
-        for idx, item in enumerate(retrieved_contexts, start=1):
-            source_id = item.get("source", f"ref_{idx}")
-            text = item.get("text", "")[:per_item_chars]
-            context_lines.append(f"[{idx}] Source ({source_id}): {text}")
-            citations.append({"ref_num": idx, "source": source_id, "type": item.get("type", "unknown")})
-
-        context_block = "\n\n".join(context_lines)
+        citations = [
+            {"ref_num": idx, "source": item.get("source", f"ref_{idx}"), "type": item.get("type", "unknown")}
+            for idx, item in enumerate(retrieved_contexts, start=1)
+        ]
+        context_block = self.context_block(retrieved_contexts)
 
         try:
             answer = self.llm_client.complete(

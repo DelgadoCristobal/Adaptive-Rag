@@ -250,12 +250,12 @@ class RAGEvaluator:
         return parse_judge_score(self._call_judge_with_retry(prompt, system_prompt), key)
 
     def evaluate_faithfulness(self, context: str, answer: str) -> Tuple[float, str]:
-        """Calculates faithfulness score in [0.0, 1.0] and justification reason."""
+        """Calculates faithfulness score in [0.0, 1.0] against `context`, the generator's own context block."""
         if not answer or not context or any(phrase in answer.lower() for phrase in REFUSAL_PHRASES):
             return 1.0, "Properly refused to hallucinate when context is missing."
 
         return self._judge(
-            FAITHFULNESS_PROMPT.format(context=context[:2000], answer=answer),
+            FAITHFULNESS_PROMPT.format(context=context, answer=answer),
             "You are a strict evaluation judge. Output valid JSON.",
             "faithfulness_score",
         )
@@ -310,7 +310,8 @@ class RAGEvaluator:
 
         if delay > 0:
             time.sleep(delay)
-        faithfulness, f_reason = self.evaluate_faithfulness("\n".join(c.get("text", "") for c in retrieved), answer)
+        # Judge against the exact context block the generator saw for these same (post-rerank) items.
+        faithfulness, f_reason = self.evaluate_faithfulness(self.synthesizer.context_block(retrieved), answer)
         if delay > 0:
             time.sleep(delay)
         relevance, r_reason = self.evaluate_relevance(q_text, answer)
