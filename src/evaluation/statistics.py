@@ -5,10 +5,12 @@ import scipy.stats as stats
 
 logger = logging.getLogger(__name__)
 
-# (result key, display name) for the five paired metrics.
+# (result key, display name) for the paired metrics. Correctness is absent from checkpoints older than
+# metrics_version 2; a metric missing from every row is skipped rather than analysed.
 METRICS = [
     ("faithfulness", "Faithfulness"),
     ("answer_relevance", "Answer Relevance"),
+    ("correctness", "Correctness (CRAG)"),
     ("context_precision", "Context Precision"),
     ("latency_ms", "Latency (ms)"),
     ("top_rerank_score", "Cross-Encoder Top-1"),
@@ -20,6 +22,7 @@ _REPORT_KEYS = {"top_rerank_score": "rerank_score"}
 METRIC_DIRECTION = {
     "faithfulness": "higher",
     "answer_relevance": "higher",
+    "correctness": "higher",
     "context_precision": "higher",
     "latency_ms": "lower",
     "top_rerank_score": "higher",
@@ -173,31 +176,41 @@ class StatisticalAnalyzer:
 
     def generate_full_report(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Generates a comprehensive evaluation report from paired evaluation rows."""
-        overall = {
-            _REPORT_KEYS.get(key, key): self.analyze_metric(
-                [r["naive"].get(key, 0.0) for r in results],
-                [r["hybrid"].get(key, 0.0) for r in results],
-                name,
-            )
-            for key, name in METRICS
-        }
+        overall: Dict[str, Dict[str, Any]] = {}
+        for key, name in METRICS:
+            if results and not any(key in r["naive"] or key in r["hybrid"] for r in results):
+                logger.info("Metric %s absent from every row (older checkpoint); skipped.", key)
+                continue
+            # Pairwise deletion: a pair is analysed only when both arms carry a value (None = not judged).
+            pairs = [
+                (r["naive"].get(key), r["hybrid"].get(key)) for r in results
+                if r["naive"].get(key) is not None and r["hybrid"].get(key) is not None
+            ]
+            d = self.analyze_metric([a for a, _ in pairs], [b for _, b in pairs], name)
+            d["n"] = len(pairs)
+            d["n_excluded"] = len(results) - len(pairs)
+            overall[_REPORT_KEYS.get(key, key)] = d
         for key, _ in METRICS:
-            d = overall[_REPORT_KEYS.get(key, key)]
+            d = overall.get(_REPORT_KEYS.get(key, key))
+            if d is None:
+                continue
             if key in DIAGNOSTIC_METRICS and "error" not in d:
                 d["diagnostic"] = True
                 d["diagnostic_note"] = _DIAGNOSTIC_NOTE
 
         # Holm-Bonferroni across the outcome family (diagnostics excluded); significance uses the adjusted p.
-        family = [
-            overall[_REPORT_KEYS.get(key, key)] for key, _ in METRICS
-            if key not in DIAGNOSTIC_METRICS and "error" not in overall[_REPORT_KEYS.get(key, key)]
+        family_keys = [
+            key for key, _ in METRICS
+            if key not in DIAGNOSTIC_METRICS and "error" not in overall.get(_REPORT_KEYS.get(key, key), {"error": 1})
         ]
+        family = [overall[_REPORT_KEYS.get(key, key)] for key in family_keys]
         for d, adj in zip(family, holm_adjust([d["p_value"] for d in family])):
             d["p_value_adjusted"] = round(adj, 5)
             d["is_significant"] = bool(adj < self.alpha)
             self._interpret(d)
         return {
             "overall": overall,
+            "holm_family": family_keys,
             "by_category": self._breakdown(results, "type"),
             "by_domain": self._breakdown(results, "domain"),
             "sample_size": len(results)
@@ -221,7 +234,9 @@ class StatisticalAnalyzer:
                 f"{d['effect_size_name']} = {d['effect_size_val']:.3f}"
             )
 
-        rel, prec, faith = (usable(k) for k in ("answer_relevance", "context_precision", "faithfulness"))
+        rel, prec, faith, corr = (
+            usable(k) for k in ("answer_relevance", "context_precision", "faithfulness", "correctness")
+        )
         if rel is None:
             return [f"- **Potencia insuficiente:** con N = {n} (< 3 pares) no es posible aplicar contrastes de hipótesis; amplíe la muestra."]
 
@@ -269,6 +284,14 @@ class StatisticalAnalyzer:
                     else "empeora significativamente" if prec["better_arm"] == "naive"
                     else "diferencia no significativa") + f" ({fmt(prec)}).")
             )
+        if corr:
+            out.append(
+                f"- **Exactitud frente al ground truth (CRAG, +1/0/-1, n = {corr['n']}):** "
+                + ("sin varianza entre condiciones." if corr["variance_note"] else
+                   ("mejora significativa" if wins(corr)
+                    else "empeora significativamente" if corr["better_arm"] == "naive"
+                    else "diferencia no significativa") + f" ({fmt(corr)}).")
+            )
         if faith:
             out.append(
                 "- **Fidelidad:** " + ("sin varianza entre condiciones." if faith["variance_note"] else f"{fmt(faith)}.")
@@ -293,6 +316,7 @@ class StatisticalAnalyzer:
         metrics_list = [
             ("faithfulness", "Faithfulness (RAGAS)"),
             ("answer_relevance", "Answer Relevance (RAGAS)"),
+            ("correctness", "Correctness (CRAG, +1/0/-1)"),
             ("context_precision", "Context Precision (RAGAS)"),
             ("latency_ms", "Latencia Respuesta (ms)"),
             ("rerank_score", "Cross-Encoder Top-1 (Semantic) [diagnostico]"),
@@ -321,6 +345,17 @@ class StatisticalAnalyzer:
                 f"{p_val_str} | {p_adj_str} | {data['effect_size_name']}: {data['effect_size_val']:.3f} | "
                 f"[{data['ci_95'][0]:.3f}, {data['ci_95'][1]:.3f}] | {sig_str} | "
                 f"{'N/A' if data.get('diagnostic') else data.get('better_arm', 'tie')} |"
+            )
+
+        partial = [
+            f"{m_name}: n = {ov[m_key]['n']} ({ov[m_key]['n_excluded']} pares excluidos)"
+            for m_key, m_name in metrics_list
+            if m_key in ov and "error" not in ov[m_key] and ov[m_key].get("n_excluded")
+        ]
+        if partial:
+            lines.append(
+                "\n> **Pares excluidos (eliminacion por pares):** pares sin valor en algun brazo (juez no parseable o "
+                "sin ground truth) se excluyen del contraste. " + "; ".join(partial) + ".\n"
             )
 
         diag = ov.get("rerank_score", {})

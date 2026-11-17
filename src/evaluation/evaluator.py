@@ -55,6 +55,32 @@ Respond ONLY in JSON format:
 {{"relevance_score": 0.0, "reason": "concise explanation"}}
 JSON:"""
 
+CORRECTNESS_PROMPT = """You are a strict grader following the CRAG benchmark protocol. Compare the ANSWER with the GROUND TRUTH for the QUESTION.
+
+Labels:
+- "correct": the ANSWER gives the ground-truth answer (same facts or values; paraphrase, units and formatting may differ) and makes no claim that contradicts it.
+- "missing": the ANSWER gives no answer (e.g. "I don't know", says the information is unavailable, refuses, or is empty) and makes no wrong claim.
+- "incorrect": the ANSWER gives a wrong answer, contradicts the GROUND TRUTH, or asserts any false fact (a hallucination).
+
+QUESTION:
+{question}
+
+GROUND TRUTH:
+{ground_truth}
+
+ANSWER:
+{answer}
+
+Respond ONLY in JSON format with exactly one of the three labels:
+{{"label": "correct"}}
+JSON:"""
+
+# CRAG scoring: a hallucinated answer is worse than admitting the answer is missing.
+CORRECTNESS_SCORES = {"correct": 1.0, "missing": 0.0, "incorrect": -1.0}
+
+# Bump when a metric is added or a judge changes, so older fingerprinted checkpoints are never merged.
+METRICS_VERSION = 2
+
 REFUSAL_PHRASES = (
     "no information provided",
     "no mention",
@@ -88,6 +114,15 @@ def parse_judge_score(response: str, key: str) -> Tuple[float, str]:
         reason_match = re.search(r'"reason"\s*:\s*"(.*)', response)
         reason = reason_match.group(1).rstrip('"} \n') if reason_match else reason
     return min(1.0, max(0.0, score)), reason or "Evaluated by judge."
+
+
+def parse_correctness_label(response: str) -> Optional[str]:
+    """Strict parse of a correctness reply: a JSON object whose "label" is one of CORRECTNESS_SCORES, else None."""
+    label = (extract_json(response) or {}).get("label")
+    if not isinstance(label, str):
+        return None
+    label = label.strip().lower()
+    return label if label in CORRECTNESS_SCORES else None
 
 
 MAX_QUOTA_WAIT_SECONDS = 120.0
@@ -250,12 +285,12 @@ class RAGEvaluator:
         return parse_judge_score(self._call_judge_with_retry(prompt, system_prompt), key)
 
     def evaluate_faithfulness(self, context: str, answer: str) -> Tuple[float, str]:
-        """Calculates faithfulness score in [0.0, 1.0] and justification reason."""
+        """Calculates faithfulness score in [0.0, 1.0] against `context`, the generator's own context block."""
         if not answer or not context or any(phrase in answer.lower() for phrase in REFUSAL_PHRASES):
             return 1.0, "Properly refused to hallucinate when context is missing."
 
         return self._judge(
-            FAITHFULNESS_PROMPT.format(context=context[:2000], answer=answer),
+            FAITHFULNESS_PROMPT.format(context=context, answer=answer),
             "You are a strict evaluation judge. Output valid JSON.",
             "faithfulness_score",
         )
@@ -270,6 +305,27 @@ class RAGEvaluator:
             "You are a strict relevance judge. Output valid JSON.",
             "relevance_score",
         )
+
+    def evaluate_correctness(
+        self, question: str, ground_truth: str, answer: str
+    ) -> Tuple[Optional[float], Optional[str]]:
+        """CRAG-style correctness against the ground truth: (score, label), or (None, None) when it cannot be judged.
+
+        A missing ground truth or an unparseable judge reply is recorded as None (excluded from the paired
+        analysis), never as 0.0. Judge call failures propagate like the other judges, discarding the sample.
+        """
+        if not str(ground_truth or "").strip():
+            logger.warning("No ground_truth for question %r; correctness not judged (None).", question[:80])
+            return None, None
+        response = self._call_judge_with_retry(
+            CORRECTNESS_PROMPT.format(question=question, ground_truth=ground_truth, answer=answer or ""),
+            "You are a strict correctness judge. Output valid JSON.",
+        )
+        label = parse_correctness_label(response)
+        if label is None:
+            logger.warning("Unparseable correctness judge reply %r; correctness recorded as None.", (response or "")[:200])
+            return None, None
+        return CORRECTNESS_SCORES[label], label
 
     def evaluate_context_precision(self, expected_source: Any, retrieved_contexts: List[Dict[str, Any]]) -> float:
         """Reciprocal rank (top-5) of the first retrieved item matching an expected source document."""
@@ -299,7 +355,7 @@ class RAGEvaluator:
         return 0.0
 
     def _evaluate_arm(
-        self, q_text: str, strategy: RetrievalStrategy, expected_src: Any, delay: float
+        self, q_text: str, strategy: RetrievalStrategy, expected_src: Any, delay: float, ground_truth: str = ""
     ) -> Dict[str, Any]:
         """Retrieve, generate and judge one experimental arm (control or treatment) for a single query."""
         t0 = time.time()
@@ -310,16 +366,22 @@ class RAGEvaluator:
 
         if delay > 0:
             time.sleep(delay)
-        faithfulness, f_reason = self.evaluate_faithfulness("\n".join(c.get("text", "") for c in retrieved), answer)
+        # Judge against the exact context block the generator saw for these same (post-rerank) items.
+        faithfulness, f_reason = self.evaluate_faithfulness(self.synthesizer.context_block(retrieved), answer)
         if delay > 0:
             time.sleep(delay)
         relevance, r_reason = self.evaluate_relevance(q_text, answer)
+        if delay > 0:
+            time.sleep(delay)
+        correctness, c_label = self.evaluate_correctness(q_text, ground_truth, answer)
 
         return {
             "faithfulness": faithfulness,
             "faithfulness_reason": f_reason,
             "answer_relevance": relevance,
             "relevance_reason": r_reason,
+            "correctness": correctness,
+            "correctness_label": c_label,
             "context_precision": self.evaluate_context_precision(expected_src, retrieved),
             "latency_ms": latency_ms,
             "top_rerank_score": round(max(rerank_scores), 4) if rerank_scores else 0.0,
@@ -342,6 +404,7 @@ class RAGEvaluator:
             "judge_backend": f"cli:{Path(cli_binary).stem.lower()}" if cli_binary else "api",
             "judge_model": self.judge_model_name,
             "judge_fallbacks": list(self.judge_fallbacks),
+            "metrics_version": METRICS_VERSION,
             "vector_top_k": settings.vector_top_k,
             "rerank_top_k": settings.rerank_top_k,
         }
@@ -368,6 +431,8 @@ class RAGEvaluator:
                 "lat_hybrid_ms": r["hybrid"]["latency_ms"],
                 "rerank_naive": r["naive"]["top_rerank_score"],
                 "rerank_hybrid": r["hybrid"]["top_rerank_score"],
+                "c_naive": r.get("correctness_naive"),
+                "c_hybrid": r.get("correctness_hybrid"),
             })
             rows.append(row)
         pd.DataFrame(rows).to_csv(ckpt_file.with_suffix(".csv"), index=False)
@@ -440,15 +505,16 @@ class RAGEvaluator:
 
                 q_text = item.get("question") or item.get("query", "")
                 expected_src = item.get("gold_document_ids") or item.get("gold_doc_ids") or item.get("expected_source") or ""
+                ground_truth = item.get("ground_truth") or item.get("answer", "")
 
                 arm_order = orders[q_id]
                 try:
                     if arm_order == "naive_first":
-                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
-                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay, ground_truth)
+                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay, ground_truth)
                     else:
-                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
-                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
+                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay, ground_truth)
+                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay, ground_truth)
                 except Exception as sample_err:
                     logger.error("Sample %s failed after retries and fallbacks (%s). Discarding to preserve statistical integrity.", q_id, sample_err)
                     console.print(f"[bold red]Discarding sample {q_id} due to judge failure: {sample_err}[/bold red]")
@@ -460,9 +526,13 @@ class RAGEvaluator:
                     "type": item.get("type") or item.get("question_type", "general"),
                     "domain": item.get("domain", "general"),
                     "question": q_text,
-                    "ground_truth": item.get("ground_truth") or item.get("answer", ""),
+                    "ground_truth": ground_truth,
                     "expected_source": expected_src,
                     "arm_order": arm_order,
+                    "correctness_naive": naive["correctness"],
+                    "correctness_hybrid": hybrid["correctness"],
+                    "correctness_label_naive": naive["correctness_label"],
+                    "correctness_label_hybrid": hybrid["correctness_label"],
                     "naive": naive,
                     "hybrid": hybrid,
                     "delta": {
@@ -471,6 +541,10 @@ class RAGEvaluator:
                         "context_precision": round(hybrid["context_precision"] - naive["context_precision"], 4),
                         "latency_ms": round(hybrid["latency_ms"] - naive["latency_ms"], 2),
                         "top_rerank_score": round(hybrid["top_rerank_score"] - naive["top_rerank_score"], 4),
+                        "correctness": (
+                            round(hybrid["correctness"] - naive["correctness"], 4)
+                            if hybrid["correctness"] is not None and naive["correctness"] is not None else None
+                        ),
                     },
                 })
                 processed_ids.add(q_id)

@@ -129,3 +129,49 @@ def test_markdown_report_marks_top1_as_diagnostic():
     md = az.format_markdown_report(az.generate_full_report(_rows()))
     assert "diagn" in md.lower()
     assert "Holm" in md
+
+
+# --- T4: correctness metric (optional, pairwise deletion) ----------------------------------------------
+
+def _with_correctness(rows, none_at=()):
+    for i, r in enumerate(rows):
+        r["naive"]["correctness"] = None if i in none_at else (-1.0, 0.0, 1.0)[i % 3]
+        r["hybrid"]["correctness"] = 1.0 if i % 2 else 0.0
+    return rows
+
+
+def test_correctness_direction_is_higher():
+    assert METRIC_DIRECTION["correctness"] == "higher"
+
+
+def test_old_rows_without_correctness_skip_the_metric_and_keep_family_of_four():
+    az = StatisticalAnalyzer()
+    report = az.generate_full_report(_rows())
+    assert "correctness" not in report["overall"]
+    assert report["holm_family"] == ["faithfulness", "answer_relevance", "context_precision", "latency_ms"]
+    assert "Correctness" not in az.format_markdown_report(report)
+
+
+def test_correctness_joins_the_holm_family_of_five():
+    az = StatisticalAnalyzer()
+    report = az.generate_full_report(_with_correctness(_rows()))
+    ov = report["overall"]
+    assert sorted(report["holm_family"]) == sorted(
+        ["faithfulness", "answer_relevance", "correctness", "context_precision", "latency_ms"]
+    )
+    expected = holm_adjust([ov[k]["p_value"] for k in report["holm_family"]])
+    for key, adj in zip(report["holm_family"], expected):
+        assert ov[key]["p_value_adjusted"] == pytest.approx(adj, abs=1e-5)
+    md = az.format_markdown_report(report)
+    assert "Correctness" in md
+
+
+def test_correctness_pairs_with_none_are_dropped_and_n_reported():
+    az = StatisticalAnalyzer()
+    rows = _with_correctness(_rows(n=12), none_at=(0, 5, 7))
+    rows[3]["hybrid"]["correctness"] = None
+    report = az.generate_full_report(rows)
+    corr = report["overall"]["correctness"]
+    assert corr["n"] == 8 and corr["n_excluded"] == 4
+    assert report["overall"]["faithfulness"]["n"] == 12 and report["overall"]["faithfulness"]["n_excluded"] == 0
+    assert "n = 8" in az.format_markdown_report(report)
