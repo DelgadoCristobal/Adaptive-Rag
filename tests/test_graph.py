@@ -41,4 +41,4 @@ def test_kuzu_graph_store(tmp_path):
     store.add_extraction_result(extraction)
 
     stats = store.get_stats()
-    assert stats["node_count"] >= 0  # Kùzu DB verified
+    assert stats == {"node_count": 2, "rel_count": 1}
