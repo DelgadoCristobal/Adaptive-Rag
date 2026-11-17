@@ -141,6 +141,12 @@ def _norm_id(value: Any) -> str:
     return str(value or "").lower().strip().replace(".md", "")
 
 
+def _doc_key(value: Any) -> str:
+    """Document identity used by context precision: normalized id without chunk suffix or `crag_doc_` prefix."""
+    key = _norm_id(value).split("_chunk_")[0]
+    return key[len("crag_doc_"):] if key.startswith("crag_doc_") else key
+
+
 def run_fingerprint(dataset_ids: List[Any], config: Dict[str, Any]) -> str:
     """First 12 hex chars of the sha256 of the sorted dataset ids plus the run config (canonical JSON)."""
     payload = json.dumps(
@@ -328,29 +334,21 @@ class RAGEvaluator:
         return CORRECTNESS_SCORES[label], label
 
     def evaluate_context_precision(self, expected_source: Any, retrieved_contexts: List[Dict[str, Any]]) -> float:
-        """Reciprocal rank (top-5) of the first retrieved item matching an expected source document."""
+        """Reciprocal rank (top-5) of the first retrieved item matching an expected source document.
+
+        Ids match exactly after normalization (lowercase, no `.md`, no `crag_doc_` prefix, no `_chunk_` suffix);
+        a graph candidate matches when any document in its `source_doc_ids` provenance does.
+        """
         if not retrieved_contexts or not expected_source:
             return 0.0
 
         expected = expected_source if isinstance(expected_source, list) else [expected_source]
-        target_ids = [_norm_id(x) for x in expected if x]
+        target_ids = {_doc_key(x) for x in expected if x} - {""}
 
         for rank, item in enumerate(retrieved_contexts[:5], start=1):
-            for key in ("source_doc_id", "source", "doc_id", "id"):
-                # Drop the chunk suffix so chunk ids map back to their document.
-                norm_src = _norm_id(item.get(key)).split("_chunk_")[0]
-                if not norm_src:
-                    continue
-                for tid in target_ids:
-                    clean_tid = tid.replace("crag_doc_", "")
-                    if (
-                        tid == norm_src
-                        or clean_tid == norm_src.replace("crag_doc_", "")
-                        or tid in norm_src
-                        or (len(norm_src) >= 12 and norm_src in tid)
-                        or (len(clean_tid) > 6 and clean_tid in norm_src)
-                    ):
-                        return 1.0 / rank
+            candidate_ids = list(item.get("source_doc_ids") or []) + [item.get(k) for k in ("source_doc_id", "source", "doc_id", "id")]
+            if any(_doc_key(c) in target_ids for c in candidate_ids if c):
+                return 1.0 / rank
 
         return 0.0
 

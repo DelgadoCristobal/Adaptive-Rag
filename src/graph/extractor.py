@@ -9,9 +9,14 @@ except ImportError:
     OpenAI = None
 
 from src.config import settings
-from .schema import Entity, Relation, ExtractionResult, ConceptNote
+from .schema import (
+    Entity, Relation, ExtractionResult, ConceptNote, concept_note_path, parse_note_frontmatter, parse_note_sources
+)
 
 logger = logging.getLogger(__name__)
+
+_WIKILINK_LINE_RE = re.compile(r"^- (\[\[.*\]\])\s*$", re.MULTILINE)
+_DESCRIPTION_RE = re.compile(r"^\*\*Description:\*\*\n(.*?)\n\n## Related Concepts", re.MULTILINE | re.DOTALL)
 
 EXTRACTION_PROMPT = """You are an expert Knowledge Graph Architect. Extract all key domain entities and directed relationships connecting them from the provided text.
 Ensure relation types are normalized to UPPER_SNAKE_CASE (for example: FOUNDED_BY, LOCATED_IN, PRODUCES, LEADS, PART_OF, ACQUIRED_BY, ASSOCIATED_WITH).
@@ -185,35 +190,47 @@ class EntityRelationExtractor:
             for r in related:
                 wikilinks.append(f"[[{r.target}|{r.relation_type}]]")
 
+            # Write concept note to vault concepts subfolder, merging with the note other documents wrote
+            note_path = concept_note_path(vault_dir, entity.id)
+            note_path.parent.mkdir(parents=True, exist_ok=True)
+            description = entity.description or ""
+            sources, aliases = [source_doc], list(entity.aliases)
+            if note_path.exists():
+                existing = note_path.read_text(encoding="utf-8", errors="ignore")
+                meta = parse_note_frontmatter(existing)
+                sources = parse_note_sources(existing) + sources
+                aliases = [str(a) for a in (meta.get("aliases") or [])] + aliases
+                wikilinks = _WIKILINK_LINE_RE.findall(existing) + wikilinks
+                old_desc = _DESCRIPTION_RE.search(existing)
+                if old_desc and len(old_desc.group(1).strip()) > len(description):
+                    description = old_desc.group(1).strip()
+            sources = list(dict.fromkeys(sources))
+            aliases = list(dict.fromkeys(aliases))
+            wikilinks = list(dict.fromkeys(wikilinks))
+
             concept_note = ConceptNote(
                 title=entity.name,
                 entity_type=entity.type,
-                description=entity.description,
+                description=description,
                 wikilinks=wikilinks,
-                source_documents=[source_doc]
+                source_documents=sources
             )
             concept_notes.append(concept_note)
 
-            # Write concept note to vault concepts subfolder
-            concepts_dir = vault_dir / "concepts"
-            concepts_dir.mkdir(parents=True, exist_ok=True)
-            note_filename = f"concept_{entity.id}.md"
-            note_path = concepts_dir / note_filename
-            
             frontmatter = {
                 "id": entity.id,
                 "type": entity.type,
                 "tags": ["concept", entity.type.lower()],
-                "source": source_doc,
-                "aliases": entity.aliases
+                "sources": sources,
+                "aliases": aliases
             }
-            
+
             wikilink_lines = "\n".join([f"- {link}" for link in wikilinks]) if wikilinks else "*No outgoing relations*"
             content = (
-                f"---\n{yaml.dump(frontmatter, sort_keys=False)}---\n\n"
+                f"---\n{yaml.dump(frontmatter, sort_keys=False, default_flow_style=None, allow_unicode=True, width=10**6)}---\n\n"
                 f"# {entity.name}\n\n"
                 f"**Type:** {entity.type}\n\n"
-                f"**Description:**\n{entity.description}\n\n"
+                f"**Description:**\n{description}\n\n"
                 f"## Related Concepts (Wikilinks)\n{wikilink_lines}\n"
             )
             note_path.write_text(content, encoding="utf-8")

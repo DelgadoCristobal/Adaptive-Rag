@@ -8,6 +8,7 @@ from itertools import zip_longest
 from pathlib import Path
 
 from src.config import settings
+from src.graph.schema import parse_note_sources
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +47,10 @@ def graph_indexed_docs(vault_dir: Optional[Path] = None) -> Set[str]:
     concepts = (vault_dir or settings.data_vault_dir) / "concepts"
     docs: Set[str] = set()
     for note in concepts.glob("*.md"):
-        match = re.search(r"^source:\s*['\"]?(.*?)['\"]?\s*$", note.read_text(encoding="utf-8", errors="ignore"), re.MULTILINE)
-        if match:
-            docs.add(match.group(1).replace(".md", "").strip())
+        for source in parse_note_sources(note.read_text(encoding="utf-8", errors="ignore")):
+            doc = source.replace(".md", "").strip()
+            if doc:
+                docs.add(doc)
     return docs
 
 

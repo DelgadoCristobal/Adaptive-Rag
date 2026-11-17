@@ -2,12 +2,17 @@ from typing import List, Dict, Any, Optional
 import logging
 from src.config import settings
 from src.graph.kuzu_store import KuzuGraphStore
-
-import re
+from src.graph.schema import parse_note_frontmatter, parse_note_sources
 
 logger = logging.getLogger(__name__)
 
-_GLOBAL_ENTITY_DOC_CACHE: Optional[Dict[str, str]] = None
+_GLOBAL_ENTITY_DOC_CACHE: Optional[Dict[str, List[str]]] = None
+
+
+def reset_entity_doc_cache() -> None:
+    """Forget the cached entity -> source documents map so the next retrieval re-reads the vault."""
+    global _GLOBAL_ENTITY_DOC_CACHE
+    _GLOBAL_ENTITY_DOC_CACHE = None
 
 
 class GraphRetriever:
@@ -16,27 +21,27 @@ class GraphRetriever:
     def __init__(self, graph_store: Optional[KuzuGraphStore] = None):
         self.graph_store = graph_store or KuzuGraphStore()
 
-    def _load_entity_doc_map(self) -> Dict[str, str]:
-        """Maps entity identifiers to their originating source doc IDs from Obsidian concept notes."""
+    def _load_entity_doc_map(self) -> Dict[str, List[str]]:
+        """Maps entity identifiers to their source doc IDs (in note order) from Obsidian concept notes."""
         global _GLOBAL_ENTITY_DOC_CACHE
         if _GLOBAL_ENTITY_DOC_CACHE is not None:
             return _GLOBAL_ENTITY_DOC_CACHE
-        
-        mapping = {}
+
+        mapping: Dict[str, List[str]] = {}
         concepts_dir = settings.data_vault_dir / "concepts"
         if concepts_dir.exists():
             for f in concepts_dir.glob("*.md"):
                 try:
                     text = f.read_text(encoding="utf-8", errors="ignore")
-                    src_match = re.search(r"^source:\s*['\"]?(.*?)['\"]?\s*$", text, re.MULTILINE)
-                    id_match = re.search(r"^id:\s*['\"]?(.*?)['\"]?\s*$", text, re.MULTILINE)
-                    src = src_match.group(1).replace(".md", "").strip() if src_match else ""
-                    ent_id = id_match.group(1).strip() if id_match else f.stem.replace("concept_", "").strip()
-                    if src and ent_id:
-                        mapping[ent_id.lower()] = src
-                        mapping[ent_id.replace(" ", "_").lower()] = src
                 except OSError as e:
                     logger.warning("Skipping unreadable concept note %s: %s", f.name, e)
+                    continue
+                docs = [s.replace(".md", "").strip() for s in parse_note_sources(text)]
+                docs = [d for d in dict.fromkeys(docs) if d]
+                ent_id = str(parse_note_frontmatter(text).get("id") or f.stem.replace("concept_", "")).strip()
+                if docs and ent_id:
+                    for key in (ent_id.lower(), ent_id.replace(" ", "_").lower()):
+                        mapping[key] = list(dict.fromkeys(mapping.get(key, []) + docs))
         _GLOBAL_ENTITY_DOC_CACHE = mapping
         return mapping
 
@@ -71,7 +76,8 @@ class GraphRetriever:
             type_label = ent.get("type", "CONCEPT")
             node_text = f"Entity '{ent.get('name')}' is a {type_label}. {desc}".strip()
 
-            source_doc = doc_map.get(str(ent_id).lower()) or doc_map.get(str(ent_id).replace(" ", "_").lower()) or ""
+            source_docs = doc_map.get(str(ent_id).lower()) or doc_map.get(str(ent_id).replace(" ", "_").lower()) or []
+            source_doc = source_docs[0] if source_docs else ""
 
             candidates.append({
                 "type": "graph_node",
@@ -79,6 +85,7 @@ class GraphRetriever:
                 "text": node_text,
                 "source": source_doc or f"graph_node:{ent_id}",
                 "source_doc_id": source_doc,
+                "source_doc_ids": list(source_docs),
                 "entity_id": ent_id,
                 "score": 0.9
             })
@@ -90,9 +97,10 @@ class GraphRetriever:
                 target_name = path.get("target_name", path.get("target"))
                 target_type = path.get("target_type", "CONCEPT")
                 
-                src_doc = doc_map.get(str(path['source']).lower()) or ""
-                tgt_doc = doc_map.get(str(path['target']).lower()) or ""
-                path_source_doc = src_doc or tgt_doc or source_doc
+                src_docs = doc_map.get(str(path['source']).lower()) or []
+                tgt_docs = doc_map.get(str(path['target']).lower()) or []
+                path_source_docs = src_docs or tgt_docs or source_docs
+                path_source_doc = path_source_docs[0] if path_source_docs else ""
 
                 # Linearize graph edge path into clear natural language sentence
                 path_text = f"The entity '{ent.get('name')}' is connected to '{target_name}' ({target_type}). {target_desc}".strip()
@@ -102,6 +110,7 @@ class GraphRetriever:
                     "text": path_text,
                     "source": path_source_doc or f"graph_path:{path['source']}->{path['target']}",
                     "source_doc_id": path_source_doc,
+                    "source_doc_ids": list(path_source_docs),
                     "score": 0.85
                 })
 
