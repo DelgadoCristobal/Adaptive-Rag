@@ -36,8 +36,8 @@ Out of scope, deferred to later phases: graph extraction quality, Cypher paramet
 
 - [x] **T1: Statistics correctness.** Use Wilcoxon signed-rank for every metric, with no Shapiro selection. Use the matched-pairs rank-biserial effect size (Kerby). Make tests two-sided, with a matching two-sided bootstrap CI. Pre-declare each metric's direction in an explicit map. Apply Holm correction across the outcome family. Exclude Top-1 from the outcome family and the conclusions. Remove the hard-coded narrative. Route: delegated writer (statistics module plus tests, with design decisions given).
 - [x] **T2: Checkpoint keying.** Key the checkpoint by a hash of the dataset ids and the run config. Filter resumed rows to the current dataset ids, and trim them to `--samples`.
-- [ ] **T3: Judge context alignment.** The synthesizer returns the exact context block it used, and faithfulness is judged against that block.
-- [ ] **T4: Correctness judge.** Judge the answer against `ground_truth` (correct / missing / hallucinated, CRAG-style) and add it to the outcome family.
+- [x] **T3: Judge context alignment.** The synthesizer returns the exact context block it used, and faithfulness is judged against that block.
+- [x] **T4: Correctness judge.** Judge the answer against `ground_truth` (correct / missing / hallucinated, CRAG-style) and add it to the outcome family.
 - [x] **T5: Arm order.** Randomise the naive/hybrid order per question with a seed, and add a warm-up query before timing.
 
 ## Acceptance criteria
@@ -67,7 +67,7 @@ master ← feat/crag-40-eval-report ← feat/eval-validity (T1) ← feat/eval-ch
 |---|---|---|---|
 | 1 | feat/eval-validity | T1 | b64c543 |
 | 2 | feat/eval-checkpoint | T2, T5 | 65931c6, bef7f09, plus the UI checkpoint fix |
-| 3 | feat/eval-judges | T3, T4 | — |
+| 3 | feat/eval-judges | T3, T4 | fa1105f, 19c8935 |
 
 T2 and T5 are grouped because both change the `run` loop in `evaluator.py`, and the arm-order seed must be part of the checkpoint fingerprint. T3 and T4 are grouped because both change the judge prompts and the synthesizer contract.
 
@@ -100,6 +100,18 @@ T2 and T5 notes:
 - Parent fix: `src/ui/app.py` hard-coded `data/eval_checkpoint.json`. It now loads the newest `eval_checkpoint*.json` and unwraps `results`. Checked with `py_compile` and a temp-dir script.
 - Declined, YAGNI: a `--checkpoint` CLI flag.
 
+| T3 | delegated writer | fa1105f | RED: ImportError on `build_context_block`, then 2 failed. GREEN: offline suite 53 passed | — |
+| T4 | delegated writer | 19c8935 | RED: ImportError on `CORRECTNESS_SCORES`, then 6 failed. GREEN: offline suite 75 passed, 2 deselected | — |
+
+T3 and T4 notes:
+- Faithfulness is judged against `synthesizer.context_block(retrieved)`, the same post-rerank list that is passed to `synthesize`. The parent spot-checked this at `evaluator.py:363,370`.
+- Correctness labels are correct, missing and incorrect, scored 1, 0 and -1. A label that does not parse, or an empty `ground_truth`, records None, never 0.
+- Statistics drop a pair when either arm has no value for that metric, and report `n` and `n_excluded`. The Holm family is 5 metrics when correctness is present and 4 on old checkpoints.
+- `METRICS_VERSION = 2` goes into the fingerprint.
+- Known gap: the UI does not show correctness yet. That belongs to Phase 4.
+
+Feature-level verification: the offline suite passed 75, with 2 deselected because they need an LLM or HF model. `test_vector.py` was not run. No live benchmark has been run; that is Phase 3.
+
 ## Next step
 
-Slice 2 assess/review, then slice 3 (T3+T4) on feat/eval-judges.
+Phase 1 is complete. Push and the stacked PRs are the user's decision. Then comes Phase 2 (graph quality), and Phase 3 (re-index and re-run the 40 and 200 benchmarks).
