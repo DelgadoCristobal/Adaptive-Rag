@@ -1,5 +1,9 @@
+from pathlib import Path
 from typing import List, Dict, Any
+import hashlib
 import re
+import unicodedata
+import yaml
 from pydantic import BaseModel, Field, model_validator
 
 
@@ -12,6 +16,44 @@ def normalize_node_name(name: str) -> str:
     clean = re.sub(r'[\s\-]+', '_', clean)
     clean = re.sub(r'^[^\w]+|[^\w]+$', '', clean)
     return clean.strip()
+
+
+
+_FRONTMATTER_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---", re.DOTALL)
+_LEGACY_SOURCE_RE = re.compile(r"^source:\s*['\"]?(.*?)['\"]?\s*$", re.MULTILINE)
+
+
+def concept_note_path(vault_dir: Path, entity_id: str) -> Path:
+    """Filesystem-safe concept note path: an ASCII slug for humans plus a hash of the exact id for uniqueness."""
+    ascii_id = unicodedata.normalize("NFKD", str(entity_id)).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9_]+", "_", ascii_id.lower()).strip("_")[:60].strip("_") or "entity"
+    digest = hashlib.sha1(str(entity_id).encode("utf-8")).hexdigest()[:8]
+    return Path(vault_dir) / "concepts" / f"concept_{slug}_{digest}.md"
+
+
+def parse_note_frontmatter(text: str) -> Dict[str, Any]:
+    """YAML frontmatter of a concept note as a dict ({} when missing or unparseable)."""
+    match = _FRONTMATTER_RE.match(text or "")
+    if not match:
+        return {}
+    try:
+        data = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def parse_note_sources(text: str) -> List[str]:
+    """Source documents of a concept note: the `sources:` list, or the legacy single `source:` field."""
+    meta = parse_note_frontmatter(text)
+    raw = meta.get("sources")
+    if raw is None:
+        raw = meta.get("source")
+    if raw is None and not meta:
+        legacy = _LEGACY_SOURCE_RE.search(text or "")
+        raw = legacy.group(1) if legacy else None
+    items = raw if isinstance(raw, list) else [raw] if raw else []
+    return list(dict.fromkeys(str(x).strip() for x in items if x is not None and str(x).strip()))
 
 
 class Entity(BaseModel):
