@@ -99,7 +99,8 @@ class GraphRetriever:
                 
                 src_docs = doc_map.get(str(path['source']).lower()) or []
                 tgt_docs = doc_map.get(str(path['target']).lower()) or []
-                path_source_docs = src_docs or tgt_docs or source_docs
+                # A path is grounded in the documents of both endpoints; fall back to the seed's documents
+                path_source_docs = list(dict.fromkeys(src_docs + tgt_docs)) or source_docs
                 path_source_doc = path_source_docs[0] if path_source_docs else ""
 
                 # Linearize graph edge path into clear natural language sentence

@@ -16,6 +16,7 @@ from src.ingestion.universal_parser import UniversalDocumentParser
 from src.graph.extractor import EntityRelationExtractor
 from src.graph.deduplication import EntityDeduplicator
 from src.graph.kuzu_store import KuzuGraphStore
+from src.graph.indexing import index_document
 from src.vector.vector_store import VectorStoreManager
 from src.retrieval.workflow import AdaptiveGraphRAGWorkflow, GraphRAGState
 from src.cache.semantic_cache import SemanticCache
@@ -696,6 +697,7 @@ with tab_ingest:
             raw_dir = settings.data_raw_dir
             raw_dir.mkdir(parents=True, exist_ok=True)
 
+            had_problems = False
             for i, f in enumerate(uploaded_docs, 1):
                 status_lbl.text(f"Procesando ({i}/{len(uploaded_docs)}): {f.name}...")
                 save_p = raw_dir / f.name
@@ -703,16 +705,22 @@ with tab_ingest:
                     w.write(f.getbuffer())
 
                 doc = parser.parse_and_export(save_p)
-                vector_store.add_documents(doc.doc_id, doc.markdown_content, metadata={"source": doc.filename})
-
-                ext_res = extractor.extract_from_text(doc.markdown_content, source_doc=doc.doc_id)
-                canon_res = dedup.deduplicate(ext_res)
-                graph_store.add_extraction_result(canon_res)
+                report = index_document(
+                    doc.doc_id, doc.markdown_content, metadata={"source": doc.filename},
+                    vector_store=vector_store, extractor=extractor, deduplicator=dedup,
+                    graph_store=graph_store, vault_dir=settings.data_vault_dir,
+                )
+                had_problems = had_problems or bool(report.error or report.chunks_failed)
+                if report.error:
+                    st.warning(f"{f.name}: la indexación falló ({report.error}).")
+                elif report.chunks_failed:
+                    st.warning(f"{f.name}: fallaron {report.chunks_failed} de {report.chunks_total} fragmentos de extracción del grafo.")
                 pbar.progress(i / len(uploaded_docs))
 
             status_lbl.text("Ingesta e indexación completada.")
-            st.success(f"Se procesaron con éxito {len(uploaded_docs)} documentos.")
-            st.rerun()
+            st.success(f"Se procesaron {len(uploaded_docs)} documentos.")
+            if not had_problems:  # keep the warnings above visible instead of rerunning them away
+                st.rerun()
 
     with col_up2:
         st.markdown("#### Documentos Ingestados en la Plataforma")

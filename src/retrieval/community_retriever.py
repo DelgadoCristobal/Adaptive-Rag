@@ -3,6 +3,7 @@ from pathlib import Path
 import logging
 from src.config import settings
 from src.graph.kuzu_store import KuzuGraphStore
+from src.graph.schema import parse_note_frontmatter
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +30,12 @@ class CommunityRetriever:
             for cf in self.concepts_dir.glob("*.md"):
                 try:
                     text = cf.read_text(encoding="utf-8", errors="ignore")
+                    # Filenames are slug+hash; the entity id lives in the frontmatter
+                    label = str(parse_note_frontmatter(text).get("id") or cf.stem.replace("concept_", ""))
                     notes.append({
                         "type": "community_summary",
                         "id": cf.stem,
-                        "text": f"Concept Summary [{cf.stem.replace('concept_', '')}]:\n{text[:600]}",
+                        "text": f"Concept Summary [{label}]:\n{text[:600]}",
                         "source": f"concept_note:{cf.name}",
                         "score": 0.88
                     })

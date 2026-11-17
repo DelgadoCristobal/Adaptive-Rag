@@ -103,7 +103,7 @@ def test_graph_candidates_expose_all_source_docs(tmp_path, extractor, monkeypatc
     assert node["source_doc_id"] == "doc_a"
     assert node["source_doc_ids"] == ["doc_a", "doc_b"]
     assert path["source_doc_id"] == "doc_a"
-    assert path["source_doc_ids"] == ["doc_a", "doc_b"]
+    assert path["source_doc_ids"] == ["doc_a", "doc_b", "legacy_doc"]  # union of both endpoints' docs
 
 
 def _evaluator():
