@@ -43,8 +43,8 @@ Out of scope:
 
 ### Slice B: `feat/graph-extraction`
 
-- [ ] **T3: Chunked, visible extraction.** Chunk size and `max_tokens` come from settings. Each chunk is extracted on its own and the results are merged. A failure is a WARNING, counted, and written nowhere. The extraction result reports whether the fallback was used and how many chunks failed.
-- [ ] **T4: One `index_document`.** All three ingestion paths call it. The UI now writes notes. `source_doc` naming is normalized. The unconditional sleep in `main.py` is removed for Ollama.
+- [x] **T3: Chunked, visible extraction.** Chunk size and `max_tokens` come from settings. Each chunk is extracted on its own and the results are merged. A failure is a WARNING, counted, and written nowhere. The extraction result reports whether the fallback was used and how many chunks failed.
+- [x] **T4: One `index_document`.** All three ingestion paths call it. The UI now writes notes. `source_doc` naming is normalized. The unconditional sleep in `main.py` is removed for Ollama.
 
 ## Checks
 
@@ -81,6 +81,20 @@ T1 and T2 notes:
   - `community_retriever` labels notes by filename stem, which is now `slug_hash`; it should read `id:` from the frontmatter.
   - The `source_doc_ids` of a graph path takes the docs of only one endpoint; it should union both.
 
+| T3 | delegated writer | a35d4b7 | RED: ImportError on `effective_chunk_chars`. GREEN: offline suite 104 passed | — |
+| T4 | delegated writer | 8f9219e | RED: ImportError on `src.graph.indexing`, plus 2 failing carried fixes. GREEN: offline suite 113 passed, 2 deselected; `py_compile` OK | — |
+
+T3 and T4 notes:
+- Chunks default to 1500 chars and `extraction_max_tokens` defaults to 1024. With `num_ctx` 2048 the budget is about 2696 chars, so no shrinking happens. Shrinking applies to `ollama/` models only.
+- `_heuristic_fallback_extraction` is deleted. A failed chunk logs a WARNING, is counted in `chunks_failed`, and contributes nothing.
+- `src/graph/indexing.py:index_document` is used by `main.py`, by `crag_loader` (a thin wrapper that keeps the vault copy) and by the UI. UI uploads now write concept notes.
+- `main.py` no longer sleeps on Ollama; other providers still wait 4.5 s.
+- `crag_loader` now extracts the whole document in chunks instead of `[:1800]`, which means more LLM calls per document.
+- Not done, because `.env.example` reads are blocked by a permission deny rule: `EXTRACTION_CHUNK_CHARS` and `EXTRACTION_MAX_TOKENS` must be added to it by the user.
+- Follow-up: Kuzu reserves about 8 TB of virtual memory per open database on Windows, and `KuzuGraphStore._instances` keeps every store open. After about 16 test databases the suite fails with "Not enough memory resources". Only `test_indexing` closes its stores. A shared conftest fixture or `close()` is needed (Phase 5).
+
+Phase 2 verification: offline suite 113 passed, 2 deselected. No live extraction was run (Phase 3).
+
 ## Next step
 
-Slice B (T3 and T4) on `feat/graph-extraction`.
+Push and PRs, with user approval. Then Phase 3: re-index and re-run the benchmark.

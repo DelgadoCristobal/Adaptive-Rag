@@ -10,6 +10,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeEl
 import datasets
 
 from src.config import settings
+from src.graph.indexing import IndexReport, index_document as shared_index_document
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -218,17 +219,12 @@ class CRAGBenchmarkLoader:
         }
 
     @staticmethod
-    def index_document(doc_id, content, metadata, vector_store, extractor, deduplicator, graph_store, vault_dir) -> None:
-        """Index one document into ChromaDB, the Obsidian vault and (via LLM extraction) the KùzuDB graph."""
-        vector_store.add_documents(doc_id=doc_id, content=content, metadata=metadata)
-        (vault_dir / f"{doc_id}.md").write_text(content, encoding="utf-8")
-        try:
-            raw_extraction = extractor.extract_from_text(content[:1800], source_doc=f"{doc_id}.md")
-            dedup_extraction = deduplicator.deduplicate(raw_extraction)
-            graph_store.add_extraction_result(dedup_extraction)
-            extractor.create_atomic_concept_notes(dedup_extraction, source_doc=f"{doc_id}.md", vault_dir=vault_dir)
-        except Exception as e:
-            logger.warning("Graph extraction failed for %s: %s", doc_id, e)
+    def index_document(doc_id, content, metadata, vector_store, extractor, deduplicator, graph_store, vault_dir) -> IndexReport:
+        """Index one CRAG document (with its vault copy) through the shared ingestion path."""
+        return shared_index_document(
+            doc_id, content, metadata=metadata, vector_store=vector_store, extractor=extractor,
+            deduplicator=deduplicator, graph_store=graph_store, vault_dir=vault_dir, write_vault_copy=True,
+        )
 
     def ingest_crag_corpus(
         self,

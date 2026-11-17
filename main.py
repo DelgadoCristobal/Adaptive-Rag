@@ -10,6 +10,7 @@ from src.config import settings
 from src.graph.extractor import EntityRelationExtractor
 from src.graph.deduplication import EntityDeduplicator
 from src.graph.kuzu_store import KuzuGraphStore
+from src.graph.indexing import IndexReport, index_document
 from src.vector.vector_store import VectorStoreManager
 from src.retrieval.hybrid_engine import HybridRetrievalEngine
 from src.generator.synthesizer import AnswerSynthesizer
@@ -79,31 +80,42 @@ def index(
         return
 
     import time
+    # Hosted free tiers need a pause between documents (<= ~12 requests/minute); local Ollama does not
+    delay = 0.0 if extractor.model.startswith("ollama/") else 4.5
     console.print(f"Processing [bold]{len(md_files)}[/bold] enterprise documents...")
+    reports = []
     for idx, md_file in enumerate(md_files, 1):
         console.print(f"  [{idx}/{len(md_files)}] Indexing [cyan]{md_file.name}[/cyan]...")
-        content = md_file.read_text(encoding="utf-8")
-        
-        # 1. Add to Vector Store
-        vector_store.add_documents(doc_id=md_file.stem, content=content, metadata={"source": md_file.name})
+        try:
+            content = md_file.read_text(encoding="utf-8")
+        except OSError as e:
+            reports.append(IndexReport(doc_id=md_file.stem, error=f"{type(e).__name__}: {e}"))
+            console.print(f"    [red]Skipped:[/red] {e}")
+            continue
 
-        # 2. Extract Entities & Relations
-        raw_extraction = extractor.extract_from_text(content, source_doc=md_file.name)
-        
-        # 3. Deduplicate Entities
-        dedup_extraction = deduplicator.deduplicate(raw_extraction)
+        report = index_document(
+            md_file.stem, content, metadata={"source": md_file.name}, vector_store=vector_store,
+            extractor=extractor, deduplicator=deduplicator, graph_store=graph_store, vault_dir=target_vault,
+        )
+        reports.append(report)
+        if report.error:
+            console.print(f"    [red]Failed:[/red] {report.error}")
+        elif report.chunks_failed:
+            console.print(f"    [yellow]{report.chunks_failed}/{report.chunks_total} extraction chunks failed[/yellow]")
 
-        # 4. Store in KùzuDB Graph Store
-        graph_store.add_extraction_result(dedup_extraction)
+        if delay and idx < len(md_files):
+            time.sleep(delay)
 
-        # 5. Generate Atomic Concept Notes with Wikilinks
-        extractor.create_atomic_concept_notes(dedup_extraction, source_doc=md_file.name, vault_dir=target_vault)
-        
-        # Safe pause (4.5s) to guarantee <= 12 requests/minute under Free Tier
-        time.sleep(4.5)
+    failed_docs = sum(1 for r in reports if r.error)
+    failed_chunks = sum(r.chunks_failed for r in reports)
+    total_chunks = sum(r.chunks_total for r in reports)
+    summary_color = "green" if not failed_docs and not failed_chunks else "yellow"
+    console.print(
+        f"[bold {summary_color}]Indexing finished: {len(reports) - failed_docs} documents ok, {failed_docs} failed; "
+        f"{failed_chunks}/{total_chunks} extraction chunks failed.[/bold {summary_color}]"
+    )
 
     stats = graph_store.get_stats()
-    console.print(f"[bold green]Indexing completed successfully![/bold green]")
     console.print(f"  - Knowledge Graph Nodes: [bold cyan]{stats['node_count']}[/bold cyan]")
     console.print(f"  - Knowledge Graph Edges: [bold cyan]{stats['rel_count']}[/bold cyan]")
 
