@@ -1,10 +1,50 @@
 from pathlib import Path
 from typing import List, Dict, Any
 import logging
+import math
+import re
 from src.config import settings
 from .schema import ExtractionResult
 
 logger = logging.getLogger(__name__)
+
+MIN_HOPS, MAX_HOPS = 1, 5
+
+# On match, a node keeps its first real name/type (endpoint placeholders use name = id and type CONCEPT)
+# and only takes a new description when it is longer than the stored one.
+NODE_UPSERT_CYPHER = """
+MERGE (e:EntityNode {id: $id})
+ON CREATE SET e.name = $name, e.type = $type, e.description = $description
+ON MATCH SET
+    e.name = CASE WHEN e.name IS NULL OR e.name = '' OR (e.name = e.id AND $name <> '') THEN $name ELSE e.name END,
+    e.type = CASE WHEN e.type IS NULL OR e.type = '' OR (e.type = 'CONCEPT' AND $type <> '') THEN $type ELSE e.type END,
+    e.description = CASE WHEN size($description) > size(coalesce(e.description, '')) THEN $description ELSE e.description END
+"""
+
+# One parameterized MERGE per (source, target, relation_type): duplicates are deduplicated by Kuzu and the
+# first description/weight wins. Values are never interpolated into the query text.
+RELATION_MERGE_CYPHER = """
+MATCH (a:EntityNode), (b:EntityNode)
+WHERE a.id = $source AND b.id = $target
+MERGE (a)-[r:RELATION {relation_type: $rel_type}]->(b)
+ON CREATE SET r.description = $description, r.weight = $weight
+"""
+
+
+def _clamp_hops(hops: Any) -> int:
+    try:
+        value = int(hops)
+    except (TypeError, ValueError):
+        value = MIN_HOPS
+    return max(MIN_HOPS, min(MAX_HOPS, value))
+
+
+def _edge_weight(weight: Any) -> float:
+    try:
+        value = float(weight)
+    except (TypeError, ValueError):
+        return 1.0
+    return value if math.isfinite(value) else 1.0
 
 
 class KuzuGraphStore:
@@ -50,8 +90,9 @@ class KuzuGraphStore:
                 "CREATE NODE TABLE EntityNode(id STRING, name STRING, type STRING, description STRING, PRIMARY KEY(id))"
             )
             logger.info("Created KùzuDB table EntityNode")
-        except Exception:
-            pass  # Table likely exists
+        except Exception as e:
+            if "already exists" not in str(e):
+                logger.warning(f"Failed to create KùzuDB table EntityNode: {e}")
 
         # General Rel table DDL
         try:
@@ -59,46 +100,30 @@ class KuzuGraphStore:
                 "CREATE REL TABLE RELATION(FROM EntityNode TO EntityNode, relation_type STRING, description STRING, weight DOUBLE)"
             )
             logger.info("Created KùzuDB table RELATION")
-        except Exception:
-            pass  # Table likely exists
+        except Exception as e:
+            if "already exists" not in str(e):
+                logger.warning(f"Failed to create KùzuDB table RELATION: {e}")
 
     def add_extraction_result(self, extraction: ExtractionResult):
         """Bulk insert entities and relations into KùzuDB."""
         if not self.conn:
             return
 
-        import re
-
-        # 1. Insert/Merge Node Entities
+        # 1. Insert/Merge Node Entities (non-destructive on match)
         for entity in extraction.entities:
             ent_id = str(entity.id).strip()
-            ent_name = str(entity.name).strip() or ent_id
-            ent_type = str(entity.type).strip().upper() or "CONCEPT"
-            ent_desc = str(entity.description or "").strip()
-
-            query = """
-            MERGE (e:EntityNode {id: $id})
-            ON CREATE SET e.name = $name, e.type = $type, e.description = $description
-            ON MATCH SET e.name = $name, e.type = $type, e.description = $description
-            """
+            if not ent_id:
+                continue
+            params = {
+                "id": ent_id,
+                "name": str(entity.name).strip() or ent_id,
+                "type": str(entity.type).strip().upper() or "CONCEPT",
+                "description": str(entity.description or "").strip(),
+            }
             try:
-                self.conn.execute(
-                    query,
-                    {
-                        "id": ent_id,
-                        "name": ent_name,
-                        "type": ent_type,
-                        "description": ent_desc
-                    }
-                )
-            except Exception:
-                try:
-                    self.conn.execute(
-                        "CREATE (e:EntityNode {id: $id, name: $name, type: $type, description: $description})",
-                        {"id": ent_id, "name": ent_name, "type": ent_type, "description": ent_desc}
-                    )
-                except Exception:
-                    pass
+                self.conn.execute(NODE_UPSERT_CYPHER, params)
+            except Exception as e:
+                logger.warning(f"Failed to upsert entity {ent_id}: {e}")
 
         # 2. Insert Relations
         for rel in extraction.relations:
@@ -107,42 +132,29 @@ class KuzuGraphStore:
             if not src_id or not tgt_id or src_id == tgt_id:
                 continue
 
-            # Ensure endpoint nodes exist
+            # Ensure endpoint nodes exist without touching existing ones
             for node_id in [src_id, tgt_id]:
                 try:
                     self.conn.execute(
                         "MERGE (e:EntityNode {id: $id}) ON CREATE SET e.name = $id, e.type = 'CONCEPT', e.description = ''",
                         {"id": node_id}
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to ensure endpoint node {node_id}: {e}")
 
             clean_rel_type = (rel.relation_type or "RELATED_TO").strip().upper()
             clean_rel_type = re.sub(r'[^A-Z0-9_]', '_', clean_rel_type) or "RELATED_TO"
-            clean_desc = (rel.description or "").replace("'", "\\'").replace('"', '\\"')
-            weight = float(rel.weight) if rel.weight else 1.0
-
-            # Prevent duplicate identical edges
+            params = {
+                "source": src_id,
+                "target": tgt_id,
+                "rel_type": clean_rel_type,
+                "description": str(rel.description or ""),
+                "weight": _edge_weight(rel.weight),
+            }
             try:
-                chk = self.conn.execute(
-                    "MATCH (a:EntityNode)-[r:RELATION]->(b:EntityNode) WHERE a.id = $source AND b.id = $target AND r.relation_type = $rel_type RETURN count(r)",
-                    {"source": src_id, "target": tgt_id, "rel_type": clean_rel_type}
-                )
-                if chk.has_next() and chk.get_next()[0] > 0:
-                    continue
-            except Exception:
-                pass
-
-            # In KuzuDB, relation properties are specified as inline literals in CREATE pattern
-            insert_cypher = f"""
-            MATCH (a:EntityNode), (b:EntityNode)
-            WHERE a.id = $source AND b.id = $target
-            CREATE (a)-[r:RELATION {{relation_type: '{clean_rel_type}', description: '{clean_desc}', weight: {weight}}}]->(b)
-            """
-            try:
-                self.conn.execute(insert_cypher, {"source": src_id, "target": tgt_id})
+                self.conn.execute(RELATION_MERGE_CYPHER, params)
             except Exception as e:
-                logger.debug(f"Failed to insert relation {src_id}->{tgt_id}: {e}")
+                logger.warning(f"Failed to insert relation {src_id}-[{clean_rel_type}]->{tgt_id}: {e}")
 
     def query_k_hop_neighborhood(self, entity_id: str, hops: int = 2) -> List[Dict[str, Any]]:
         """Traverse graph up to K-hops from target entity_id and return connected paths."""
@@ -150,6 +162,7 @@ class KuzuGraphStore:
             return []
 
         paths = []
+        hops = _clamp_hops(hops)  # int-cast and clamped: the only value interpolated into the query
         cypher = f"""
         MATCH (a:EntityNode)-[r:RELATION*1..{hops}]->(b:EntityNode)
         WHERE a.id = $id
