@@ -144,3 +144,46 @@ def test_explicit_checkpoint_path_is_used(tmp_path):
     e = make_evaluator()
     e.run_paired_benchmark(dataset_path=str(dataset), checkpoint_path=str(target), delay_seconds=0)
     assert e.last_checkpoint_path == target and target.exists()
+
+
+# --- T5: seeded arm order and warm-up ------------------------------------------------------------
+
+def test_arm_order_is_deterministic_for_a_seed_and_mixes_both_orders():
+    ids = [f"q{i}" for i in range(20)]
+    a = ev.arm_orders(ids, seed=42)
+    assert a == ev.arm_orders(ids, seed=42)
+    assert set(a.values()) == {"naive_first", "hybrid_first"}
+    assert any(ev.arm_orders(ids, seed=s) != a for s in range(1, 5))
+
+
+def test_seed_changes_fingerprint():
+    e = make_evaluator()
+    assert run_fingerprint(["q0"], e.run_config(seed=1)) != run_fingerprint(["q0"], e.run_config(seed=2))
+
+
+def test_run_follows_arm_order_and_records_it(tmp_path):
+    dataset = write_dataset(tmp_path, n=6)
+    e = make_evaluator()
+    results = e.run_paired_benchmark(dataset_path=str(dataset), checkpoint_path=str(tmp_path / "c.json"), delay_seconds=0, seed=7)
+    expected = ev.arm_orders([f"q{i}" for i in range(6)], seed=7)
+    assert {r["id"]: r["arm_order"] for r in results} == expected
+
+    timed = [c for c in e.calls if c[0] == "retrieve"][2:]  # skip the two warm-up retrievals
+    for i, r in enumerate(results):
+        first = timed[2 * i][2]
+        assert first == (RetrievalStrategy.NAIVE_VECTOR if r["arm_order"] == "naive_first" else RetrievalStrategy.HYBRID_ADAPTIVE)
+
+
+def test_warm_up_runs_once_before_timed_calls_and_only_when_pending(tmp_path):
+    dataset = write_dataset(tmp_path, n=3)
+    ckpt = tmp_path / "c.json"
+    e = make_evaluator()
+    e.run_paired_benchmark(dataset_path=str(dataset), checkpoint_path=str(ckpt), delay_seconds=0)
+    retrievals = [c for c in e.calls if c[0] == "retrieve"]
+    assert len(retrievals) == 2 + 3 * 2  # one warm-up per arm, then two arms per question
+    assert {c[2] for c in retrievals[:2]} == {RetrievalStrategy.NAIVE_VECTOR, RetrievalStrategy.HYBRID_ADAPTIVE}
+    assert all(c[1] == "question 0" for c in retrievals[:2])
+
+    e2 = make_evaluator()
+    e2.run_paired_benchmark(dataset_path=str(dataset), checkpoint_path=str(ckpt), delay_seconds=0)
+    assert e2.calls == []  # nothing pending: no warm-up

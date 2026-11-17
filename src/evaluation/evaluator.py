@@ -114,6 +114,15 @@ def run_fingerprint(dataset_ids: List[Any], config: Dict[str, Any]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
 
 
+def arm_orders(dataset_ids: List[Any], seed: int) -> Dict[Any, str]:
+    """Per-question arm order ("naive_first"/"hybrid_first") from one Random(seed) drawn over the whole dataset.
+
+    Drawing over every id (not only pending ones) keeps each question's order stable across resumed runs.
+    """
+    rng = random.Random(seed)
+    return {q_id: "naive_first" if rng.random() < 0.5 else "hybrid_first" for q_id in dataset_ids}
+
+
 def _free_sibling(path: Path) -> Path:
     """First `<stem>_<n><suffix>` next to `path` that does not exist yet."""
     n = 1
@@ -318,10 +327,17 @@ class RAGEvaluator:
             "answer": answer,
         }
 
-    def run_config(self) -> Dict[str, Any]:
+    def _warm_up(self, q_text: str) -> None:
+        """Untimed retrieval+generation through both arms so neither arm absorbs model/index load latency."""
+        for strategy in (RetrievalStrategy.NAIVE_VECTOR, RetrievalStrategy.HYBRID_ADAPTIVE):
+            retrieved, _ = self.hybrid_engine.retrieve(q_text, strategy=strategy)
+            self.synthesizer.synthesize(q_text, retrieved)
+
+    def run_config(self, seed: int = 42) -> Dict[str, Any]:
         """Everything (besides the dataset ids) that must match for checkpoint rows to be comparable."""
         cli_binary = getattr(self.cli_judge, "binary", None)
         return {
+            "arm_order_seed": seed,
             "generator_model": self.model_name,
             "judge_backend": f"cli:{Path(cli_binary).stem.lower()}" if cli_binary else "api",
             "judge_model": self.judge_model_name,
@@ -362,7 +378,8 @@ class RAGEvaluator:
         checkpoint_path: Optional[str] = None,
         max_samples: Optional[int] = None,
         delay_seconds: Optional[float] = None,
-        no_checkpoint: bool = False
+        no_checkpoint: bool = False,
+        seed: int = 42,
     ) -> List[Dict[str, Any]]:
         """Run the paired benchmark, resuming only from a checkpoint with the same dataset+config fingerprint.
 
@@ -377,7 +394,8 @@ class RAGEvaluator:
             dataset = dataset[:max_samples]
 
         dataset_ids = [item["id"] for item in dataset]
-        config = self.run_config()
+        config = self.run_config(seed)
+        orders = arm_orders(dataset_ids, seed)
         fingerprint = run_fingerprint(dataset_ids, config)
         meta = {"fingerprint": fingerprint, "config": config, "dataset_ids": dataset_ids}
         explicit = checkpoint_path is not None
@@ -396,6 +414,13 @@ class RAGEvaluator:
         console.print(f"[cyan]Checkpoint: {ckpt_file} (fingerprint {fingerprint})[/cyan]")
 
         processed_ids = {r["id"] for r in results}
+
+        pending = [item for item in dataset if item["id"] not in processed_ids]
+        if pending:
+            try:
+                self._warm_up(pending[0].get("question") or pending[0].get("query", ""))
+            except Exception as warm_err:  # a real failure will surface again (and be handled) in the timed loop
+                logger.warning("Warm-up query failed (%s); continuing without it.", str(warm_err)[:150])
 
         with Progress(
             SpinnerColumn(),
@@ -416,9 +441,14 @@ class RAGEvaluator:
                 q_text = item.get("question") or item.get("query", "")
                 expected_src = item.get("gold_document_ids") or item.get("gold_doc_ids") or item.get("expected_source") or ""
 
+                arm_order = orders[q_id]
                 try:
-                    naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
-                    hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                    if arm_order == "naive_first":
+                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
+                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                    else:
+                        hybrid = self._evaluate_arm(q_text, RetrievalStrategy.HYBRID_ADAPTIVE, expected_src, effective_delay)
+                        naive = self._evaluate_arm(q_text, RetrievalStrategy.NAIVE_VECTOR, expected_src, effective_delay)
                 except Exception as sample_err:
                     logger.error("Sample %s failed after retries and fallbacks (%s). Discarding to preserve statistical integrity.", q_id, sample_err)
                     console.print(f"[bold red]Discarding sample {q_id} due to judge failure: {sample_err}[/bold red]")
@@ -432,6 +462,7 @@ class RAGEvaluator:
                     "question": q_text,
                     "ground_truth": item.get("ground_truth") or item.get("answer", ""),
                     "expected_source": expected_src,
+                    "arm_order": arm_order,
                     "naive": naive,
                     "hybrid": hybrid,
                     "delta": {
